@@ -9,7 +9,7 @@ Part of the three-phase pipeline:
 
 Submodules
 ----------
-model           Model loading, prompt formatting, tokenization utilities
+model           Model loading, prompt/tokenization utilities (incl. get_first_answer_token)
 hooks           TransformerLens hook operations (attention extraction, knockout)
 sat_probe       SAT Probe for F1 diagnosis (attention → logistic regression)
 logit_lens      Layer-by-layer vocabulary projection (shared by F2-b / F3-a)

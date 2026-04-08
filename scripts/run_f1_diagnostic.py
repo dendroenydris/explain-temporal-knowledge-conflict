@@ -40,6 +40,7 @@ from tatm.model import (
     check_match,
     find_year_positions,
     generate_answer,
+    get_first_answer_token,
     load_model,
 )
 from tatm.hooks import (
@@ -452,20 +453,16 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
             ko_bar.set_postfix_str("skip (no year toks)", refresh=True)
             continue
 
-        # get first-token IDs for answer_new and answer_old
-        new_tids = model.tokenizer.encode(f" {answer_new}", add_special_tokens=False)[:1]
-        old_tids = model.tokenizer.encode(f" {answer_old}", add_special_tokens=False)[:1]
-        track_tids = list(set(new_tids + old_tids))
+        # get first meaningful token IDs (skip SentencePiece space markers)
+        new_tid = get_first_answer_token(model, answer_new)
+        old_tid = get_first_answer_token(model, answer_old)
+        track_tids = list({t for t in [new_tid, old_tid] if t >= 0})
 
         ko = attention_knockout(
             model, tokens, year_pos,
             knockout_layers=ko_layers,
-            answer_token_ids=track_tids,
+            answer_token_ids=track_tids if track_tids else None,
         )
-
-        # compute probability drop for answer_new first token
-        new_tid = new_tids[0] if new_tids else None
-        old_tid = old_tids[0] if old_tids else None
         entry = {
             "instance_id": inst.get("instance_id", f"inst_{idx}"),
             "answer_new": answer_new,
@@ -541,17 +538,15 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
         if not year_pos:
             continue
 
-        new_tids = model.tokenizer.encode(f" {answer_new}", add_special_tokens=False)[:1]
-        old_tids = model.tokenizer.encode(f" {answer_old}", add_special_tokens=False)[:1]
-        track_tids = list(set(new_tids + old_tids))
+        new_tid = get_first_answer_token(model, answer_new)
+        old_tid_d = get_first_answer_token(model, answer_old)
+        track_tids = list({t for t in [new_tid, old_tid_d] if t >= 0})
 
         ko = attention_knockout(
             model, tokens, year_pos,
             knockout_layers=ko_layers_deep,
-            answer_token_ids=track_tids,
+            answer_token_ids=track_tids if track_tids else None,
         )
-
-        new_tid = new_tids[0] if new_tids else None
         entry_d: dict = {
             "instance_id": inst.get("instance_id", f"inst_{idx}"),
             "knockout_layers": f"{ko_layers_deep[0]}-{ko_layers_deep[-1]}",

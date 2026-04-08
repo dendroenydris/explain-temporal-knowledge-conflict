@@ -156,10 +156,10 @@ def run_str_patching(
             skipped["gen_corr"] += 1
             continue
 
-        # Answer token IDs
+        # Answer token IDs — must be valid and distinct
         new_tid = get_first_answer_token(model, answer_new)
         old_tid = get_first_answer_token(model, answer_old)
-        if new_tid < 0 or old_tid < 0:
+        if new_tid < 0 or old_tid < 0 or new_tid == old_tid:
             skipped["token_id"] += 1
             continue
 
@@ -284,7 +284,7 @@ def compute_route_scores(
 
         new_tid = get_first_answer_token(model, answer_new)
         old_tid = get_first_answer_token(model, answer_old)
-        if new_tid < 0 or old_tid < 0:
+        if new_tid < 0 or old_tid < 0 or new_tid == old_tid:
             continue
 
         traj = run_logit_lens(model, tokens, new_tid, old_tid)

@@ -323,6 +323,29 @@ def find_year_positions(
     return sorted(positions)
 
 
+# ── Answer token lookup ──────────────────────────────────────────────────────
+
+def get_first_answer_token(model: "HookedTransformer", answer: str) -> int:
+    """Return the token ID of the first *meaningful* subword of *answer*.
+
+    SentencePiece tokenizers (Phi-3, LLaMA-2) may split ``" Mario"`` into
+    ``[▁, M, ario]`` where ``▁`` (id=29871) is a whitespace-only marker
+    shared by all answers.  Using that marker makes every logit-diff
+    identically zero and all Logit Lens trajectories identical.
+    We skip any leading token that decodes to pure whitespace.
+
+    Returns ``-1`` if no non-whitespace token can be found.
+    """
+    for prefix in (" ", ""):
+        ids = model.tokenizer.encode(f"{prefix}{answer}", add_special_tokens=False)
+        if not ids:
+            continue
+        for tid in ids:
+            if model.tokenizer.decode([tid]).strip():
+                return tid
+    return -1
+
+
 # ── Answer matching ──────────────────────────────────────────────────────────
 
 def check_match(generated: str, expected: str) -> bool:
