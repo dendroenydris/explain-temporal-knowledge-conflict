@@ -32,15 +32,23 @@ class LogitTrajectory:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_first_answer_token(model: HookedTransformer, answer: str) -> int:
-    """Return the token ID of the first subword of *answer*.
+    """Return the token ID of the first *meaningful* subword of *answer*.
 
-    Tries with a leading space first (the common in-context form) then
-    without.  Returns ``-1`` if the tokenizer produces nothing.
+    SentencePiece tokenizers (Phi-3, LLaMA-2) may split ``" Mario"`` into
+    ``[▁, M, ario]`` where ``▁`` is a whitespace-only marker shared by all
+    answers.  Using that marker makes every logit-diff identically zero.
+    We skip any leading token that decodes to pure whitespace.
+
+    Returns ``-1`` if the tokenizer produces nothing usable.
     """
     for prefix in (" ", ""):
         ids = model.tokenizer.encode(f"{prefix}{answer}", add_special_tokens=False)
-        if ids:
-            return ids[0]
+        if not ids:
+            continue
+        for tid in ids:
+            decoded = model.tokenizer.decode([tid]).strip()
+            if decoded:                # non-empty after strip → meaningful token
+                return tid
     return -1
 
 
