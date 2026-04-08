@@ -1,0 +1,15 @@
+=== Wikidata Layer-1 Stats ===
+Properties   : 8
+FactTimelines: 262
+Change events: 519
+Year range   : 2010–2023
+Evidence     : Wikipedia revisions
+
+  head of government                  (P6)  raw=  20  selected= 20
+  head of state                       (P35)  raw=  81  selected= 81
+  chairperson                         (P488)  raw=  21  selected= 21
+  officeholder                        (P1308)  raw=  47  selected= 47
+  chief executive officer             (P169)  raw=  39  selected= 39
+  director / manager                  (P1037)  raw=  12  selected= 12
+  member of sports team               (P54)  raw=   4  selected=  4
+  head coach                          (P286)  raw=  38  selected= 38
