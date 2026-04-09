@@ -140,12 +140,23 @@ def run_reverts_old_filter(
     REVERTS_OLD: B1-failure (output ≠ answer_new) AND output matches answer_old.
     These are the diagnostic targets for F2/F3 — genuine temporal conflict failures.
 
+    REVERTS_OTHER: B1-failure where output ≠ answer_new AND output ≠ answer_old.
+    NOTE: this does NOT mean the model has no parametric memory.  Typical cases:
+      • Model knows a *third* answer (different time period's answer)
+      • Name variant / transliteration mismatch (check_match false negative)
+      • Refusal or hallucination
+      • Unresolved Wikidata QID in expected answer (data bug)
+
     Returns
     -------
     reverts_old : list of B1 instance dicts that satisfy REVERTS_OLD
     b1_success_map : {instance_id → True if B1-success} — reusable by F2-c
         to avoid duplicate generation
     """
+    import re as _re
+    def _is_qid(s: str) -> bool:
+        return bool(_re.fullmatch(r"Q\d+", s.strip()))
+
     print("\n" + "=" * 60)
     print("REVERTS_OLD Filter")
     print("=" * 60)
@@ -157,12 +168,20 @@ def run_reverts_old_filter(
     b1_success_map: dict[str, bool] = {}
     log = []
 
+    n_qid_answers = 0
     bar = tqdm(b1_instances, desc="REVERTS_OLD filter", unit="inst", dynamic_ncols=True)
     for inst in bar:
         ctx      = inst.get("context", inst.get("evidence_new", ""))
         question = inst.get("question", "")
         ans_new  = inst.get("answer_new", "")
         ans_old  = inst.get("answer_old", "")
+
+        # Flag unresolved QID answers as bad data (check_match always returns
+        # False for QIDs, so they will land in reverts_other if the model is
+        # wrong, confusing the count).
+        has_qid_answer = _is_qid(ans_new) or _is_qid(ans_old)
+        if has_qid_answer:
+            n_qid_answers += 1
 
         prompt    = build_prompt(ctx, question, template=template)
         generated = generate_answer(model, prompt)
@@ -180,6 +199,7 @@ def run_reverts_old_filter(
             "answer_old": ans_old,
             "b1_success": is_new,
             "reverts_old": (not is_new) and is_old,
+            "bad_data_qid": has_qid_answer,
         }
         log.append(entry)
 
@@ -204,6 +224,12 @@ def run_reverts_old_filter(
     print(f"\n  B1-success      : {len(b1_success)}/{n}  ({100*len(b1_success)/n:.1f}%)")
     print(f"  REVERTS_OLD     : {len(reverts_old)}/{n}  ({100*len(reverts_old)/n:.1f}%)")
     print(f"  REVERTS_OTHER   : {len(reverts_other)}/{n}  ({100*len(reverts_other)/n:.1f}%)")
+    if n_qid_answers:
+        print(f"  [!] Unresolved QID answers found: {n_qid_answers} instances — "
+              "fix data pipeline (eval_builder.py label resolution)")
+    print(f"\n  Note: REVERTS_OTHER may include: (a) model knows a *third* answer "
+          f"(different time-period parametric memory), (b) name-variant check_match "
+          f"misses, (c) refusals.  It does NOT imply absence of parametric memory.")
     print(f"\n→ {len(reverts_old)} REVERTS_OLD instances passed to F2/F3 diagnosis")
 
     with open(out_dir / "reverts_old_filter.json", "w") as f:
@@ -213,6 +239,13 @@ def run_reverts_old_filter(
                 "n_b1_success": len(b1_success),
                 "n_reverts_old": len(reverts_old),
                 "n_reverts_other": len(reverts_other),
+                "n_qid_answers": n_qid_answers,
+                "note_reverts_other": (
+                    "Output ≠ answer_new AND output ≠ answer_old. Does NOT imply "
+                    "no parametric memory. May include: (a) third-year parametric "
+                    "memory, (b) name variants check_match cannot reconcile, "
+                    "(c) refusals, (d) unresolved Wikidata QIDs in expected answer."
+                ),
                 "log": log,
             },
             f, indent=2, ensure_ascii=False,
@@ -308,32 +341,48 @@ def run_f2b(
         print("  No RouteScore results (check answer token lookup).")
         return
 
-    route_scores = [r.route_score for r in results]
-    p_at_lt      = [r.p_new_at_temporal for r in results]
-    p_at_final   = [r.p_new_at_final for r in results]
+    route_scores      = [r.route_score for r in results]
+    route_scores_peak = [r.route_score_peak for r in results]
+    p_at_lt           = [r.p_new_at_temporal for r in results]
+    p_at_peak         = [r.p_new_peak for r in results]
+    p_at_final        = [r.p_new_at_final for r in results]
+    peak_layers       = [r.peak_layer for r in results]
 
     print(f"\n  n = {len(results)}")
     print(f"  Mean  P(answer_new) at L_T:    {np.mean(p_at_lt):.4f}")
+    print(f"  Mean  P(answer_new) peak:      {np.mean(p_at_peak):.4f}  "
+          f"(avg peak layer: {np.mean(peak_layers):.1f})")
     print(f"  Mean  P(answer_new) at L_final:{np.mean(p_at_final):.4f}")
-    print(f"  Mean  RouteScore:               {np.mean(route_scores):+.4f}")
-    print(f"  Fraction RouteScore > 0.02 (F2 signal): "
-          f"{sum(1 for s in route_scores if s > 0.02)/len(route_scores):.1%}")
+    print(f"  Mean  RouteScore (L_T basis):  {np.mean(route_scores):+.4f}")
+    print(f"  Mean  RouteScore (peak basis):  {np.mean(route_scores_peak):+.4f}")
+    print(f"  Fraction peak RouteScore > 0.05 (F2 signal): "
+          f"{sum(1 for s in route_scores_peak if s > 0.05)/len(route_scores_peak):.1%}")
 
     output = {
         "l_t": max(temporal_layers),
         "temporal_layers": temporal_layers,
         "n": len(results),
         "mean_p_new_at_lt": float(np.mean(p_at_lt)),
+        "mean_p_new_peak": float(np.mean(p_at_peak)),
+        "mean_peak_layer": float(np.mean(peak_layers)),
         "mean_p_new_at_final": float(np.mean(p_at_final)),
         "mean_route_score": float(np.mean(route_scores)),
         "median_route_score": float(np.median(route_scores)),
-        "pct_above_0.02": float(sum(1 for s in route_scores if s > 0.02) / len(route_scores)),
+        "mean_route_score_peak": float(np.mean(route_scores_peak)),
+        "median_route_score_peak": float(np.median(route_scores_peak)),
+        "pct_above_0.02_lt": float(sum(1 for s in route_scores if s > 0.02) / len(route_scores)),
+        "pct_above_0.05_peak": float(
+            sum(1 for s in route_scores_peak if s > 0.05) / len(route_scores_peak)
+        ),
         "per_instance": [
             {
                 "instance_id": r.instance_id,
                 "p_new_at_temporal": r.p_new_at_temporal,
+                "p_new_peak": r.p_new_peak,
+                "peak_layer": r.peak_layer,
                 "p_new_at_final": r.p_new_at_final,
                 "route_score": r.route_score,
+                "route_score_peak": r.route_score_peak,
                 # Full trajectory arrays (useful for plotting)
                 "probs_new": r.trajectory.probs_new.tolist(),
                 "probs_old": r.trajectory.probs_old.tolist(),

@@ -72,11 +72,25 @@ def _year_to_objects(
 
     Duplicates within the same (qid, year) are removed.
     """
+    import re as _re
     year_map: dict[int, dict[str, str]] = defaultdict(dict)
     for stmt in statements:
         for y in _active_years(stmt["year_start"], stmt["year_end"], range_start, range_end):
             qid = stmt["object_qid"]
             lbl = stmt["object_label"]
+            # The Wikibase label service falls back to the QID string itself when
+            # no English label is available.  Store the QID as the label only as a
+            # last resort, but warn so the user knows to rerun with a fix.
+            if not lbl or _re.fullmatch(r"Q\d+", lbl):
+                import warnings
+                warnings.warn(
+                    f"Unresolved label for {qid} (label='{lbl}'). "
+                    "The QID will be stored as the object label; resulting "
+                    "eval instances should be discarded.  Consider re-running "
+                    "the Layer-1 build after the label resolution is fixed.",
+                    stacklevel=4,
+                )
+                lbl = qid  # Keep QID as fallback — detected later by check_match
             year_map[y][qid] = lbl
 
     # Stable sort: alphabetical by QID for reproducibility

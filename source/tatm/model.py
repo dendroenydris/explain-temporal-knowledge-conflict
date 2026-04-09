@@ -349,20 +349,49 @@ def get_first_answer_token(model: "HookedTransformer", answer: str) -> int:
 # ── Answer matching ──────────────────────────────────────────────────────────
 
 def check_match(generated: str, expected: str) -> bool:
-    """Case-insensitive answer matching with two-tier logic.
+    """Case-insensitive answer matching with three-tier logic.
 
-    Tier 1 (strict): expected is a substring of generated.
-    Tier 2 (loose) : the first token of expected (usually the first name or
-                     a key entity word) appears in generated.  Handles title
-                     variants like "Baron McFall" vs "Lord McFall".
+    Tier 1 (strict):  expected is a substring of generated.
+    Tier 2 (loose):   the first token of expected (≥4 chars) appears in
+                      generated.  Handles "Baron McFall" vs "Lord McFall".
+    Tier 3 (variant): any word ≥6 chars from expected appears in generated,
+                      split on whitespace, hyphens, and commas.  Handles
+                      transliteration variants ("Yevgeny" vs "Yevgeni"),
+                      title abbreviations ("Lord Neuberger of Abbotsbury" vs
+                      "David Neuberger, Baron Neuberger of Abbotsbury"), and
+                      script-romanisation pairs ("Tokayev" vs "Toqaev" share
+                      the middle name "Jomart").
+
+    Special case: if expected looks like an unresolved Wikidata QID (starts
+    with "Q" followed only by digits) the match always returns False so the
+    instance is visibly flagged as bad data rather than silently correct.
     """
+    import re as _re
+    # Guard against unresolved QIDs in the dataset
+    if _re.fullmatch(r"Q\d+", expected.strip()):
+        return False
+
     gen_lower = generated.lower().strip()
     exp_lower = expected.lower().strip()
+
+    # Tier 1 – substring
     if exp_lower in gen_lower:
         return True
-    # loose: first whitespace-delimited word that is ≥4 chars (skip short titles)
+
+    # Tier 2 – first distinctive word
     first_word = next((w for w in exp_lower.split() if len(w) >= 4), "")
-    return bool(first_word and first_word in gen_lower)
+    if first_word and first_word in gen_lower:
+        return True
+
+    # Tier 3 – any word ≥6 chars shared between expected and generated
+    def _words(s: str) -> list[str]:
+        return [w for w in _re.split(r"[\s\-,]+", s) if len(w) >= 6]
+
+    for word in _words(exp_lower):
+        if word in gen_lower:
+            return True
+
+    return False
 
 
 def _collect_eos_ids(tokenizer) -> list[int]:

@@ -236,11 +236,29 @@ def run_str_patching(
 
 @dataclass
 class RouteScoreResult:
-    """RouteScore and full Logit Lens trajectory for one instance."""
+    """RouteScore and full Logit Lens trajectory for one instance.
+
+    Two complementary scores:
+
+    route_score_lt   = P^{L_T}(answer_new) − P^{L_final}(answer_new)
+                       Original definition: > 0 means signal at temporal-head
+                       layer then attenuates.  Often near-zero for Phi-3
+                       because L_T=10 is before the signal builds up.
+
+    route_score_peak = max_{l ≥ L_T} P^l(answer_new) − P^{L_final}(answer_new)
+                       Better for models where temporal routing signal emerges
+                       in later layers (L20-L29) rather than at L_T itself.
+                       > 0.05 is a strong F2 signal.
+
+    peak_layer       : layer index where the peak occurred.
+    """
     instance_id: str
     p_new_at_temporal: float   # P^{L_T}(answer_new)
     p_new_at_final: float      # P^{L_final}(answer_new)
-    route_score: float         # p_new_at_temporal − p_new_at_final
+    p_new_peak: float          # max P^l(answer_new) for l ≥ L_T
+    peak_layer: int            # layer where max is achieved
+    route_score: float         # p_new_at_temporal − p_new_at_final  (original)
+    route_score_peak: float    # p_new_peak − p_new_at_final         (robust)
     trajectory: LogitTrajectory
 
 
@@ -293,11 +311,21 @@ def compute_route_scores(
         p_final = float(traj.probs_new[-1])
         rs = p_temporal - p_final
 
+        # Robust RouteScore: peak probability at or after L_T, then drop.
+        probs_from_lt = traj.probs_new[l_t:]
+        peak_idx = int(max(range(len(probs_from_lt)), key=lambda i: probs_from_lt[i]))
+        p_peak = float(probs_from_lt[peak_idx])
+        peak_layer = l_t + peak_idx
+        rs_peak = p_peak - p_final
+
         results.append(RouteScoreResult(
             instance_id=iid,
             p_new_at_temporal=p_temporal,
             p_new_at_final=p_final,
+            p_new_peak=p_peak,
+            peak_layer=peak_layer,
             route_score=rs,
+            route_score_peak=rs_peak,
             trajectory=traj,
         ))
         bar.set_postfix(rs=f"{rs:+.3f}", n=len(results))
