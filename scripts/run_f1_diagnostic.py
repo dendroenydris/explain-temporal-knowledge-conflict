@@ -7,7 +7,12 @@ methodology:
   F1-a  SAT Probe        — logistic regression on attention-to-year features
   F1-b  Attention Compare — B1-success vs B1-failure vs B3 at temporal heads
   F1-c  Attention Knockout — causal test: block year-token attention, measure
-                             probability drop for answer_new
+                             probability drop for answer_new.
+                             Includes random-token control baseline:
+                             the same number of random (non-year) tokens are
+                             knocked out to validate that year-token knockout
+                             is *specifically* causal, not a generic attention
+                             disruption effect.
 
 Usage
 -----
@@ -399,12 +404,58 @@ def run_f1b(model, b1_instances, b3_instances, y_labels, top_heads, template, ou
     return results
 
 
+# ── F1-c helpers ─────────────────────────────────────────────────────────────
+
+import random as _random
+
+def _sample_random_positions(
+    seq_len: int,
+    exclude: set[int],
+    n: int,
+    n_samples: int = 3,
+    seed: int = 42,
+) -> list[list[int]]:
+    """Sample *n_samples* sets of *n* random token positions.
+
+    Positions in *exclude* (year positions + last/prediction position) are
+    never selected.  If there aren't enough remaining positions to fill a
+    full set of *n*, we return as many as possible for that sample.
+
+    Parameters
+    ----------
+    seq_len   : total number of tokens in the prompt
+    exclude   : set of positions to never sample (year tokens + last token)
+    n         : number of positions per sample (= number of year tokens)
+    n_samples : how many independent random samples to draw
+    seed      : for reproducibility
+
+    Returns
+    -------
+    List of *n_samples* position-lists.  Each inner list has exactly *n*
+    elements (or fewer if not enough candidates are available).
+    """
+    candidates = [p for p in range(seq_len) if p not in exclude]
+    rng = _random.Random(seed)
+    samples = []
+    for _ in range(n_samples):
+        chosen = rng.sample(candidates, min(n, len(candidates)))
+        samples.append(sorted(chosen))
+    return samples
+
+
 # ── F1-c: Attention knockout ─────────────────────────────────────────────────
 
 def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
-    """Causal test: knock out attention to year tokens, measure probability drop."""
+    """Causal test: knock out attention to year tokens, measure probability drop.
+
+    Also runs a random-token control: the same number of randomly chosen
+    (non-year) tokens are knocked out to verify that the year-token effect is
+    *specific* and not a generic consequence of disrupting any attention.
+    """
+    N_RANDOM_SAMPLES = 3   # random draws per instance for the control
+
     print("\n" + "=" * 60)
-    print("F1-c: Attention Knockout")
+    print("F1-c: Attention Knockout  (+random-token control)")
     print("=" * 60)
 
     # run knockout on B1-success instances only (to measure causal necessity)
@@ -421,12 +472,13 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
     ko_layers_full = list(range(model.cfg.n_layers))
 
     # Also prepare a deep-only window (top 25% of layers) for comparison.
-    n = model.cfg.n_layers
-    ko_layers_deep = list(range(n * 3 // 4, n))   # e.g. L24–31 for 32-layer model
+    n_layers = model.cfg.n_layers
+    ko_layers_deep = list(range(n_layers * 3 // 4, n_layers))
 
     print(f"Knockout layer window (full):  0–{ko_layers_full[-1]}")
     print(f"Knockout layer window (deep):  {ko_layers_deep[0]}–{ko_layers_deep[-1]}")
-    ko_layers = ko_layers_full   # use full range as default
+    print(f"Random-token control samples per instance: {N_RANDOM_SAMPLES}")
+    ko_layers = ko_layers_full
 
     ko_results = []
     ko_bar = tqdm(
@@ -445,6 +497,8 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
 
         prompt = build_prompt(context, question, template=template)
         tokens = model.to_tokens(prompt, prepend_bos=False)
+        seq_len = tokens.shape[-1]
+
         year_pos = find_year_positions(tokens[0], model.tokenizer, target_year=t_new)
         if not year_pos:
             year_pos = find_year_positions(tokens[0], model.tokenizer)
@@ -458,41 +512,90 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
         old_tid = get_first_answer_token(model, answer_old)
         track_tids = list({t for t in [new_tid, old_tid] if t >= 0})
 
+        # ── Year-token knockout ──────────────────────────────────────────────
         ko = attention_knockout(
             model, tokens, year_pos,
             knockout_layers=ko_layers,
             answer_token_ids=track_tids if track_tids else None,
         )
-        entry = {
+
+        entry: dict = {
             "instance_id": inst.get("instance_id", f"inst_{idx}"),
             "answer_new": answer_new,
             "answer_old": answer_old,
             "n_year_tokens_blocked": len(year_pos),
+            "year_positions": year_pos,
             "knockout_layers": f"{ko_layers[0]}-{ko_layers[-1]}",
         }
 
         if new_tid is not None and new_tid in ko["probs_clean"]:
             p_clean = ko["probs_clean"][new_tid]
             p_ko = ko["probs_ko"][new_tid]
-            entry["p_new_clean"] = p_clean
-            entry["p_new_knockout"] = p_ko
-            entry["p_new_drop"] = p_clean - p_ko
-            entry["p_new_drop_relative"] = (
-                (p_clean - p_ko) / max(p_clean, 1e-12)
-            )
+            entry["p_new_clean"]         = p_clean
+            entry["p_new_knockout"]      = p_ko
+            entry["p_new_drop"]          = p_clean - p_ko
+            entry["p_new_drop_relative"] = (p_clean - p_ko) / max(p_clean, 1e-12)
 
         if old_tid is not None and old_tid in ko["probs_clean"]:
             p_clean = ko["probs_clean"][old_tid]
-            p_ko = ko["probs_ko"][old_tid]
-            entry["p_old_clean"] = p_clean
+            p_ko    = ko["probs_ko"][old_tid]
+            entry["p_old_clean"]   = p_clean
             entry["p_old_knockout"] = p_ko
-            entry["p_old_gain"] = p_ko - p_clean
+            entry["p_old_gain"]    = p_ko - p_clean
+
+        # ── Random-token control ─────────────────────────────────────────────
+        # Exclude year positions and the prediction (last) position.
+        # We sample N_RANDOM_SAMPLES sets so the per-instance estimate
+        # of "random disruption" is averaged and more stable.
+        exclude = set(year_pos) | {seq_len - 1}
+        rand_position_sets = _sample_random_positions(
+            seq_len, exclude, n=len(year_pos),
+            n_samples=N_RANDOM_SAMPLES,
+            seed=idx,   # deterministic per instance
+        )
+
+        rand_drops: list[float] = []
+        rand_details: list[dict] = []
+        for sample_i, rand_pos in enumerate(rand_position_sets):
+            if not rand_pos:
+                continue
+            ko_rand = attention_knockout(
+                model, tokens, rand_pos,
+                knockout_layers=ko_layers,
+                answer_token_ids=track_tids if track_tids else None,
+            )
+            if new_tid is not None and new_tid in ko_rand["probs_clean"]:
+                p_c  = ko_rand["probs_clean"][new_tid]
+                p_kr = ko_rand["probs_ko"][new_tid]
+                rel_drop = (p_c - p_kr) / max(p_c, 1e-12)
+                rand_drops.append(rel_drop)
+                rand_details.append({
+                    "sample": sample_i,
+                    "rand_positions": rand_pos,
+                    "p_new_drop_relative": rel_drop,
+                })
+
+        if rand_drops:
+            entry["rand_control"] = {
+                "n_samples": len(rand_drops),
+                "mean_drop_relative": float(np.mean(rand_drops)),
+                "max_drop_relative": float(np.max(rand_drops)),
+                "details": rand_details,
+            }
+            # Specificity ratio: year drop / mean random drop.
+            # > 1.0 means year knockout is MORE disruptive than random.
+            # > 2.0 is a strong specificity signal.
+            year_drop = entry.get("p_new_drop_relative", 0.0)
+            mean_rand = entry["rand_control"]["mean_drop_relative"]
+            entry["specificity_ratio"] = year_drop / max(abs(mean_rand), 1e-6)
 
         ko_results.append(entry)
         drop_pct = entry.get("p_new_drop_relative", float("nan"))
+        spec     = entry.get("specificity_ratio", float("nan"))
         ko_bar.set_postfix(
             year_toks=len(year_pos),
             drop=f"{drop_pct:+.2f}" if drop_pct == drop_pct else "n/a",
+            spec=f"{spec:.1f}x" if spec == spec else "n/a",
             refresh=True,
         )
 
@@ -510,36 +613,69 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
         print(f"    Mean   p(answer_new) drop: {mean_drop:+.4f}")
         print(f"    Median p(answer_new) drop: {median_drop:+.4f}")
         print(f"    Fraction >10% drop:        {pct_10:.2%}")
-        return {"mean_drop": mean_drop, "median_drop": median_drop, "pct_above_10": pct_10}
+
+        # ── Random control summary ───────────────────────────────────────────
+        rand_mean_drops = [
+            r["rand_control"]["mean_drop_relative"]
+            for r in results
+            if "rand_control" in r
+        ]
+        if rand_mean_drops:
+            rand_mean  = float(np.mean(rand_mean_drops))
+            rand_p10   = sum(1 for d in rand_mean_drops if d > 0.10) / len(rand_mean_drops)
+            spec_ratios = [
+                r["specificity_ratio"] for r in results if "specificity_ratio" in r
+            ]
+            mean_spec = float(np.mean(spec_ratios)) if spec_ratios else float("nan")
+            print(f"    [control] Mean random-token drop:   {rand_mean:+.4f}")
+            print(f"    [control] Fraction random >10% drop:{rand_p10:.2%}")
+            print(f"    Specificity ratio (year/random):    {mean_spec:.2f}x")
+            if mean_spec > 2.0:
+                print(f"    → year-token knockout is SPECIFIC (ratio > 2)")
+            elif mean_spec > 1.0:
+                print(f"    → year-token knockout is moderately specific (ratio > 1)")
+            else:
+                print(f"    → year-token effect not clearly specific vs random")
+        return {
+            "mean_drop": mean_drop,
+            "median_drop": median_drop,
+            "pct_above_10": pct_10,
+            "rand_mean_drop": float(np.mean(rand_mean_drops)) if rand_mean_drops else None,
+            "rand_pct_above_10": rand_p10 if rand_mean_drops else None,
+            "mean_specificity_ratio": float(np.mean(spec_ratios)) if rand_mean_drops else None,
+        }
+
+    full_stats: dict = {}
+    deep_stats: dict = {}
 
     if ko_results:
         print(f"\nResults over {len(ko_results)} B1-success instances:")
         full_stats = _print_drops("full L0–L31 knockout", ko_results)
 
     # ── Deep-layer knockout (last 25% of layers) for comparison ──────────────
-    # Re-run with ko_layers_deep to isolate whether year-token attention in
-    # deep layers (L24–31) is causally necessary.  These are the layers where
-    # F1-b shows year tokens receive the most attention (0.05–0.20).
-    print(f"\n  Running deep-layer knockout ({ko_layers_deep[0]}–{ko_layers_deep[-1]}) for comparison…")
+    print(f"\n  Running deep-layer knockout ({ko_layers_deep[0]}–{ko_layers_deep[-1]}) "
+          "with random control…")
     ko_deep_results = []
     for idx in success_indices:
         inst = b1_instances[idx]
-        context  = inst.get("evidence_new", inst.get("context", ""))
-        question = inst.get("question", "")
+        context    = inst.get("evidence_new", inst.get("context", ""))
+        question   = inst.get("question", "")
         answer_new = inst.get("answer_new", "")
         answer_old = inst.get("answer_old", "")
-        t_new = inst.get("t_new")
+        t_new      = inst.get("t_new")
 
-        prompt   = build_prompt(context, question, template=template)
-        tokens   = model.to_tokens(prompt, prepend_bos=False)
+        prompt  = build_prompt(context, question, template=template)
+        tokens  = model.to_tokens(prompt, prepend_bos=False)
+        seq_len = tokens.shape[-1]
+
         year_pos = find_year_positions(tokens[0], model.tokenizer, target_year=t_new)
         if not year_pos:
             year_pos = find_year_positions(tokens[0], model.tokenizer)
         if not year_pos:
             continue
 
-        new_tid = get_first_answer_token(model, answer_new)
-        old_tid_d = get_first_answer_token(model, answer_old)
+        new_tid    = get_first_answer_token(model, answer_new)
+        old_tid_d  = get_first_answer_token(model, answer_old)
         track_tids = list({t for t in [new_tid, old_tid_d] if t >= 0})
 
         ko = attention_knockout(
@@ -549,27 +685,60 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
         )
         entry_d: dict = {
             "instance_id": inst.get("instance_id", f"inst_{idx}"),
+            "n_year_tokens_blocked": len(year_pos),
             "knockout_layers": f"{ko_layers_deep[0]}-{ko_layers_deep[-1]}",
         }
         if new_tid is not None and new_tid in ko["probs_clean"]:
             p_clean = ko["probs_clean"][new_tid]
             p_ko    = ko["probs_ko"][new_tid]
-            drop    = p_clean - p_ko
-            entry_d["p_new_drop_relative"] = drop / p_clean if p_clean > 0 else 0.0
+            entry_d["p_new_drop_relative"] = (p_clean - p_ko) / max(p_clean, 1e-12)
+
+        # Random control for deep layers
+        exclude = set(year_pos) | {seq_len - 1}
+        rand_pos_sets = _sample_random_positions(
+            seq_len, exclude, n=len(year_pos),
+            n_samples=N_RANDOM_SAMPLES, seed=idx,
+        )
+        rand_drops_d: list[float] = []
+        for rand_pos in rand_pos_sets:
+            if not rand_pos:
+                continue
+            ko_r = attention_knockout(
+                model, tokens, rand_pos,
+                knockout_layers=ko_layers_deep,
+                answer_token_ids=track_tids if track_tids else None,
+            )
+            if new_tid is not None and new_tid in ko_r["probs_clean"]:
+                p_c  = ko_r["probs_clean"][new_tid]
+                p_kr = ko_r["probs_ko"][new_tid]
+                rand_drops_d.append((p_c - p_kr) / max(p_c, 1e-12))
+
+        if rand_drops_d:
+            year_drop_d = entry_d.get("p_new_drop_relative", 0.0)
+            mean_rand_d = float(np.mean(rand_drops_d))
+            entry_d["rand_control"] = {
+                "mean_drop_relative": mean_rand_d,
+            }
+            entry_d["specificity_ratio"] = year_drop_d / max(abs(mean_rand_d), 1e-6)
+
         ko_deep_results.append(entry_d)
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     if ko_deep_results:
-        deep_stats = _print_drops(f"deep L{ko_layers_deep[0]}–L{ko_layers_deep[-1]} only", ko_deep_results)
+        deep_stats = _print_drops(
+            f"deep L{ko_layers_deep[0]}–L{ko_layers_deep[-1]} only",
+            ko_deep_results,
+        )
 
     summary = {
         "knockout_layers_full": ko_layers_full,
         "knockout_layers_deep": ko_layers_deep,
+        "n_random_control_samples": N_RANDOM_SAMPLES,
         "n_instances": len(ko_results),
-        "full_stats": full_stats if ko_results else {},
-        "deep_stats": deep_stats if ko_deep_results else {},
+        "full_stats": full_stats,
+        "deep_stats": deep_stats,
         "per_instance_full": ko_results,
         "per_instance_deep": ko_deep_results,
     }
