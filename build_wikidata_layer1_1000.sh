@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --job-name=wd_layer1_1000
-#SBATCH --account=yuxin.xue
+#SBATCH --account=aisc
 #SBATCH --mem=16G
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/wd_layer1_1000_%j.out
