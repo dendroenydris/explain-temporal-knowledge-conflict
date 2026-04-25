@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=cpu-batch
+#SBATCH --partition=aisc-batch
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --job-name=wd_layer1_1000
