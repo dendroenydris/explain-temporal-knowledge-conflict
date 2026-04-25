@@ -19,6 +19,9 @@ Usage
     # Politics only, 20 per property
     python code/scripts/build_wikidata_layer1.py --n 20 --pids P6 P35 P39
 
+    # Build roughly 1000 timelines across all configured properties
+    python code/scripts/build_wikidata_layer1.py --n 1000 --target-total 1000 --max-pages 100
+
     # Skip Wikipedia (fast smoke-test; synthetic evidence only)
     python code/scripts/build_wikidata_layer1.py --no-wiki
 
@@ -63,6 +66,8 @@ def _score(tl: FactTimeline) -> float:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--n",           type=int, default=1,  help="Timelines per property (default: 1)")
+    p.add_argument("--target-total", type=int, default=None,
+                   help="Optional global cap after per-property ranking, e.g. 1000")
     p.add_argument("--pids",        nargs="+", default=list(PROPERTY_META.keys()), metavar="PID")
     p.add_argument("--year-start",  type=int, default=YEAR_START)
     p.add_argument("--year-end",    type=int, default=YEAR_END)
@@ -125,20 +130,43 @@ def main() -> None:
         all_timelines.extend(chosen)
         stat_rows.append(f"  {label:35s} ({pid})  raw={len(timelines):4d}  selected={len(chosen):3d}")
 
+    if args.target_total is not None and len(all_timelines) > args.target_total:
+        all_timelines.sort(key=_score, reverse=True)
+        all_timelines = all_timelines[: args.target_total]
+    elif args.target_total is not None and len(all_timelines) < args.target_total:
+        logger.warning(
+            "Only built %d timelines, below target-total=%d. "
+            "Increase --max-pages or add more properties to collect more candidates.",
+            len(all_timelines),
+            args.target_total,
+        )
+
     # Write Layer-1
     with open(out_path, "w", encoding="utf-8") as fh:
         for tl in all_timelines:
             fh.write(tl.to_json() + "\n")
+
+    selected_by_pid = {pid: 0 for pid in pids}
+    for tl in all_timelines:
+        selected_by_pid[tl.property_pid] = selected_by_pid.get(tl.property_pid, 0) + 1
 
     total_changes = sum(tl.n_changes for tl in all_timelines)
     stats = "\n".join([
         "=== Wikidata Layer-1 Stats ===",
         f"Properties   : {len(pids)}",
         f"FactTimelines: {len(all_timelines)}",
+        f"Target total : {args.target_total or 'none'}",
         f"Change events: {total_changes}",
         f"Year range   : {args.year_start}–{args.year_end}",
         f"Evidence     : {'synthetic' if args.no_wiki else 'Wikipedia revisions'}",
-        "", *stat_rows,
+        "",
+        *[
+            f"  {PROPERTY_META[pid]['label']:35s} ({pid})  selected={selected_by_pid.get(pid, 0):3d}"
+            for pid in pids
+        ],
+        "",
+        "Raw per-property candidates:",
+        *stat_rows,
     ])
     stats_path.write_text(stats + "\n", encoding="utf-8")
     print(f"\n{stats}\n\n[OK] {out_path}")
