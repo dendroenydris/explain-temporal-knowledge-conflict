@@ -1,4 +1,7 @@
 #!/bin/bash
+#SBATCH --partition=cpu-batch
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
 #SBATCH --job-name=wd_layer1_1000
 #SBATCH --account=yuxin.xue
 #SBATCH --mem=16G
