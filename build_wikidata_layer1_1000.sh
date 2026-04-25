@@ -14,28 +14,19 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 mkdir -p logs data/processed
 
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 MAX_PAGES="${MAX_PAGES:-100}"
 TARGET_TOTAL="${TARGET_TOTAL:-1000}"
 N_PER_PROPERTY="${N_PER_PROPERTY:-1000}"
 OUT_JSONL="data/processed/wikidata_layer1_1000.jsonl"
 
-if [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
-  source "${HOME}/miniconda3/etc/profile.d/conda.sh"
-elif [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
-  source "${HOME}/anaconda3/etc/profile.d/conda.sh"
-fi
-
-command -v conda >/dev/null || {
-  echo "[ERROR] conda not found. Load conda first, or install Miniconda on the HPC login node." >&2
+if [ -f ".venv/bin/activate" ]; then
+  source .venv/bin/activate
+else
+  echo "[ERROR] .venv not found. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
   exit 1
-}
-
-if ! conda env list | awk '{print $1}' | grep -qx "${CONDA_ENV_NAME}"; then
-  conda env create -f environment.yml
 fi
 
-conda activate "${CONDA_ENV_NAME}"
+python -m pip install -r requirements.txt
 
 python - <<'PY'
 import importlib.util

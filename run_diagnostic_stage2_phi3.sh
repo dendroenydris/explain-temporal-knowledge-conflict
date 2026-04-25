@@ -12,7 +12,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p logs results
 
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 DATA_JSONL="${DATA_JSONL:-data/processed/wikidata_layer2_1000.jsonl}"
 MODEL="${MODEL:-microsoft/phi-3-mini-4k-instruct}"
 MODEL_TAG="${MODEL_TAG:-phi3}"
@@ -21,21 +20,14 @@ F1_OUT_DIR="${F1_OUT_DIR:-results/f1_diagnostic_1000_${MODEL_TAG}}"
 OUT_DIR="${OUT_DIR:-results/f2_diagnostic_1000_${MODEL_TAG}}"
 TEMPORAL_HEADS="${TEMPORAL_HEADS:-${F1_OUT_DIR}/f1a_sat_probe.json}"
 
-if [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
-  source "${HOME}/miniconda3/etc/profile.d/conda.sh"
-elif [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
-  source "${HOME}/anaconda3/etc/profile.d/conda.sh"
-fi
-
-command -v conda >/dev/null || {
-  echo "[ERROR] conda not found. Load conda before submitting this job." >&2
+if [ -f ".venv/bin/activate" ]; then
+  source .venv/bin/activate
+else
+  echo "[ERROR] .venv not found. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
   exit 1
-}
-
-if ! conda env list | awk '{print $1}' | grep -qx "${CONDA_ENV_NAME}"; then
-  conda env create -f environment.yml
 fi
-conda activate "${CONDA_ENV_NAME}"
+
+python -m pip install -r requirements.txt
 
 [ -f "${DATA_JSONL}" ] || {
   echo "[ERROR] Missing data file: ${DATA_JSONL}" >&2
