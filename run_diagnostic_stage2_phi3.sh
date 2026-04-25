@@ -20,13 +20,16 @@ F1_OUT_DIR="${F1_OUT_DIR:-results/f1_diagnostic_1000_${MODEL_TAG}}"
 OUT_DIR="${OUT_DIR:-results/f2_diagnostic_1000_${MODEL_TAG}}"
 TEMPORAL_HEADS="${TEMPORAL_HEADS:-${F1_OUT_DIR}/f1a_sat_probe.json}"
 
-if [ -f ".venv/bin/activate" ]; then
-  source .venv/bin/activate
-else
-  echo "[ERROR] .venv not found. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
-  exit 1
+if [ ! -f ".venv/bin/activate" ]; then
+  command -v python3 >/dev/null || {
+    echo "[ERROR] python3 not found." >&2
+    exit 1
+  }
+  python3 -m venv .venv
 fi
 
+source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 [ -f "${DATA_JSONL}" ] || {
