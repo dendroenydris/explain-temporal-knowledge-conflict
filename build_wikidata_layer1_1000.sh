@@ -46,6 +46,7 @@ python scripts/build_wikidata_layer1.py \
   --n "${N_PER_PROPERTY}" \
   --target-total "${TARGET_TOTAL}" \
   --max-pages "${MAX_PAGES}" \
+  # --require-real-evidence \
   --out "${OUT_JSONL}"
 
 python - <<'PY'
@@ -83,6 +84,17 @@ missing_evidence = sum(
     for state in row.get("states", [])
     if not state.get("evidence_text") or not state.get("source_url")
 )
+non_revision_evidence = sum(
+    1
+    for row in rows
+    for state in row.get("states", [])
+    if "oldid=" not in state.get("source_url", "")
+)
+
+if non_revision_evidence:
+    raise SystemExit(
+        f"[ERROR] found {non_revision_evidence} states without Wikipedia revision evidence"
+    )
 
 by_relation = Counter(row.get("property_label", "") for row in rows)
 manifest = [
@@ -91,6 +103,7 @@ manifest = [
     f"Rows              : {len(rows)}",
     f"Unique fact_ids   : {len(set(fact_ids))}",
     f"Missing evidence  : {missing_evidence}",
+    f"Non-revision evidence: {non_revision_evidence}",
     "",
     "By relation:",
     *[f"  {rel:35s} {count}" for rel, count in by_relation.most_common()],

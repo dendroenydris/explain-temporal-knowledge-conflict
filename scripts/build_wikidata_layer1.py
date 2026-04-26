@@ -58,9 +58,43 @@ YEAR_START   = 2010
 YEAR_END     = 2023
 
 
+def _write_timelines(path: Path, timelines: list[FactTimeline], mode: str = "w") -> None:
+    with open(path, mode, encoding="utf-8") as fh:
+        for tl in timelines:
+            fh.write(tl.to_json() + "\n")
+
+
+def _write_progress(
+    path: Path,
+    *,
+    stat_rows: list[str],
+    written_count: int,
+    target_total: int | None,
+    complete: bool,
+) -> None:
+    status = "complete" if complete else "in_progress"
+    progress = "\n".join([
+        "=== Wikidata Layer-1 Progress ===",
+        f"Status           : {status}",
+        f"Timelines written: {written_count}",
+        f"Target total     : {target_total or 'none'}",
+        "",
+        "Completed properties:",
+        *(stat_rows or ["  none"]),
+    ])
+    path.write_text(progress + "\n", encoding="utf-8")
+
+
 def _score(tl: FactTimeline) -> float:
     name_penalty = max(0.0, (len(tl.subject_label) - 20) / 100)
     return len(tl.states) * 0.3 + tl.n_changes * 2.0 + (tl.year_end - tl.year_start) * 0.2 - name_penalty
+
+
+def _has_only_real_revision_evidence(tl: FactTimeline) -> bool:
+    return all(
+        state.evidence_text and "oldid=" in (state.source_url or "")
+        for state in tl.states
+    )
 
 
 def main() -> None:
@@ -75,6 +109,8 @@ def main() -> None:
                    help="SPARQL pages per property, 200 rows/page (default: 5)")
     p.add_argument("--no-wiki",     action="store_true",
                    help="Skip Wikipedia; fill evidence_text with synthetic sentences")
+    p.add_argument("--require-real-evidence", action="store_true",
+                   help="Drop timelines unless every YearState has Wikipedia revision evidence")
     p.add_argument("--cache-only",  action="store_true",
                    help="Only use cached SPARQL pages; error on any cache miss (for offline re-runs)")
     p.add_argument("--out",         default=str(DEFAULT_OUT))
@@ -82,7 +118,16 @@ def main() -> None:
 
     out_path   = Path(args.out)
     stats_path = out_path.with_suffix("").with_name(out_path.stem + "_stats.txt")
+    progress_path = out_path.with_suffix("").with_name(out_path.stem + "_progress.txt")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("", encoding="utf-8")
+    _write_progress(
+        progress_path,
+        stat_rows=[],
+        written_count=0,
+        target_total=args.target_total,
+        complete=False,
+    )
 
     pids = [pid for pid in args.pids if pid in PROPERTY_META]
     if not pids:
@@ -127,8 +172,24 @@ def main() -> None:
             logger.info("   Enriching %d timelines with Wikipedia evidence …", len(chosen))
             enrich_timelines(chosen, cache_dir=CACHE_ROOT, progress=False)
 
+        if args.require_real_evidence:
+            before = len(chosen)
+            chosen = [tl for tl in chosen if _has_only_real_revision_evidence(tl)]
+            dropped = before - len(chosen)
+            if dropped:
+                logger.info("   Dropped %d timelines without full Wikipedia revision evidence", dropped)
+
         all_timelines.extend(chosen)
         stat_rows.append(f"  {label:35s} ({pid})  raw={len(timelines):4d}  selected={len(chosen):3d}")
+        _write_timelines(out_path, chosen, mode="a")
+        _write_progress(
+            progress_path,
+            stat_rows=stat_rows,
+            written_count=len(all_timelines),
+            target_total=args.target_total,
+            complete=False,
+        )
+        logger.info("   Wrote checkpoint: %d timelines appended to %s", len(chosen), out_path)
 
     if args.target_total is not None and len(all_timelines) > args.target_total:
         all_timelines.sort(key=_score, reverse=True)
@@ -141,10 +202,9 @@ def main() -> None:
             args.target_total,
         )
 
-    # Write Layer-1
-    with open(out_path, "w", encoding="utf-8") as fh:
-        for tl in all_timelines:
-            fh.write(tl.to_json() + "\n")
+    # Rewrite final output after optional global ranking/capping. During the run,
+    # out_path already contains per-property checkpoints.
+    _write_timelines(out_path, all_timelines, mode="w")
 
     selected_by_pid = {pid: 0 for pid in pids}
     for tl in all_timelines:
@@ -169,6 +229,13 @@ def main() -> None:
         *stat_rows,
     ])
     stats_path.write_text(stats + "\n", encoding="utf-8")
+    _write_progress(
+        progress_path,
+        stat_rows=stat_rows,
+        written_count=len(all_timelines),
+        target_total=args.target_total,
+        complete=True,
+    )
     print(f"\n{stats}\n\n[OK] {out_path}")
 
     # Sample
