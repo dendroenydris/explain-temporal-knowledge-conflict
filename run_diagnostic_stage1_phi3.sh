@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 mkdir -p logs results
 
 DATA_JSONL="${DATA_JSONL:-data/processed/wikidata_layer2_1000.jsonl}"
