@@ -1,9 +1,10 @@
 #!/bin/bash
+#SBATCH --partition=aisc-batch
 #SBATCH --job-name=tatm_stage2_phi3
-#SBATCH --account=yuxin.xue
+#SBATCH --account=aisc
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/tatm_stage2_phi3_%j.out
 #SBATCH --error=logs/tatm_stage2_phi3_%j.err
 
