@@ -2,6 +2,7 @@
 #SBATCH --partition=aisc-batch
 #SBATCH --job-name=tatm_stage1_phi3
 #SBATCH --account=aisc
+#SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
 #SBATCH --time=24:00:00
