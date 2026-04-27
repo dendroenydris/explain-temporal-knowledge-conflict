@@ -21,16 +21,21 @@ TEMPLATE="${TEMPLATE:-phi3}"
 F1_OUT_DIR="${F1_OUT_DIR:-results/f1_diagnostic_1000_${MODEL_TAG}}"
 OUT_DIR="${OUT_DIR:-results/f2_diagnostic_1000_${MODEL_TAG}}"
 TEMPORAL_HEADS="${TEMPORAL_HEADS:-${F1_OUT_DIR}/f1a_sat_probe.json}"
+ARCH="$(uname -m)"
+VENV_DIR="${VENV_DIR:-.venv-${ARCH}}"
 
-if [ ! -f ".venv/bin/activate" ]; then
+echo "ARCH=${ARCH}"
+echo "VENV_DIR=${VENV_DIR}"
+
+if [ ! -f "${VENV_DIR}/bin/activate" ]; then
   command -v python3 >/dev/null || {
     echo "[ERROR] python3 not found." >&2
     exit 1
   }
-  python3 -m venv .venv
+  python3 -m venv "${VENV_DIR}"
 fi
 
-source .venv/bin/activate
+source "${VENV_DIR}/bin/activate"
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
