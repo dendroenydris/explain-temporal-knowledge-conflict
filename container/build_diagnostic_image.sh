@@ -25,14 +25,18 @@ if [ ! -f "${PROJECT_ROOT}/requirements.txt" ] || [ ! -f "${SCRIPT_DIR}/Dockerfi
 fi
 
 IMAGE_TAG="${IMAGE_TAG:-kc-diagnostic:latest}"
-BASE_IMAGE="${BASE_IMAGE:-nvcr.io#nvidia/pytorch:24.07-py3}"
+BASE_IMAGE="${BASE_IMAGE:-pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime}"
 SQSH_OUT="${SQSH_OUT:-${SCRIPT_DIR}/kc-diagnostic.sqsh}"
-WORK_DIR="${SLURM_SCRATCH:-${TMPDIR:-/tmp}}/kc-container-${SLURM_JOB_ID:-$$}"
+WORK_BASE="${WORK_BASE:-${SCRIPT_DIR}/.enroot-work}"
+WORK_DIR="${WORK_BASE}/kc-container-${SLURM_JOB_ID:-$$}"
 SQSH_TMP="${WORK_DIR}/$(basename "${SQSH_OUT}")"
+CLEAN_WORK_DIR="${CLEAN_WORK_DIR:-1}"
 
 cd "${PROJECT_ROOT}"
 
 echo "PROJECT_ROOT=${PROJECT_ROOT}"
+echo "BASE_IMAGE=${BASE_IMAGE}"
+echo "WORK_BASE=${WORK_BASE}"
 echo "WORK_DIR=${WORK_DIR}"
 echo "SQSH_TMP=${SQSH_TMP}"
 echo "SQSH_OUT=${SQSH_OUT}"
@@ -67,6 +71,9 @@ fi
 
 cp "${SQSH_TMP}" "${SQSH_OUT}"
 echo "[OK] Exported ${SQSH_OUT}"
+if [ "${CLEAN_WORK_DIR}" = "1" ]; then
+  rm -rf "${WORK_DIR}"
+fi
 echo "Submit Pyxis jobs from ${PROJECT_ROOT} with:"
 echo "  CONTAINER_IMAGE=container/$(basename "${SQSH_OUT}") sbatch run_diagnostic_stage1_phi3_container.sh"
 
