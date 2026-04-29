@@ -18,9 +18,8 @@ DATA_JSONL="${DATA_JSONL:-data/processed/wikidata_layer2_1000.jsonl}"
 MODEL="${MODEL:-microsoft/phi-3-mini-4k-instruct}"
 MODEL_TAG="${MODEL_TAG:-phi3}"
 TEMPLATE="${TEMPLATE:-phi3}"
-F1_OUT_DIR="${F1_OUT_DIR:-results/f1_diagnostic_1000_${MODEL_TAG}}"
 OUT_DIR="${OUT_DIR:-results/f2_diagnostic_1000_${MODEL_TAG}}"
-TEMPORAL_HEADS="${TEMPORAL_HEADS:-${F1_OUT_DIR}/f1a_sat_probe.json}"
+TEMPORAL_HEADS="${TEMPORAL_HEADS:-data/external/temporal_heads/paper_temporal_heads.json}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 
 command -v conda >/dev/null || {
@@ -38,7 +37,7 @@ conda activate "${CONDA_ENV_NAME}"
 
 [ -f "${TEMPORAL_HEADS}" ] || {
   echo "[ERROR] Missing temporal heads file: ${TEMPORAL_HEADS}" >&2
-  echo "Run stage 1 first: sbatch run_diagnostic_stage1_${MODEL_TAG}.sh" >&2
+  echo "Expected the paper-derived temporal heads file at data/external/temporal_heads/paper_temporal_heads.json" >&2
   exit 1
 }
 

@@ -1,0 +1,93 @@
+{
+  "source": "[13] Does Time Have Its Place? Temporal Heads: Where Language Models Recall Time-specific Information",
+  "notes": "For each model, top_heads lists the primary temporal heads first, followed by backup temporal heads reported in the paper figures.",
+  "models": {
+    "llama2-7b-chat-hf": {
+      "model": "meta-llama/Llama-2-7b-chat-hf",
+      "top_heads": [
+        {
+          "layer": 18,
+          "head": 3,
+          "coef": "paper_table_2",
+          "label": "temporal_head"
+        },
+        {
+          "layer": 15,
+          "head": 0,
+          "coef": "paper_table_2",
+          "label": "temporal_head"
+        },
+        {
+          "layer": 16,
+          "head": 10,
+          "coef": "paper_figure_9",
+          "label": "backup_temporal_head"
+        },
+        {
+          "layer": 20,
+          "head": 17,
+          "coef": "paper_figure_9",
+          "label": "backup_temporal_head"
+        },
+        {
+          "layer": 31,
+          "head": 25,
+          "coef": "paper_figure_9",
+          "label": "backup_temporal_head"
+        }
+      ]
+    },
+    "qwen1.5-7b-chat": {
+      "model": "Qwen/Qwen1.5-7B-Chat",
+      "top_heads": [
+        {
+          "layer": 17,
+          "head": 15,
+          "coef": "paper_table_2",
+          "label": "temporal_head"
+        },
+        {
+          "layer": 0,
+          "head": 7,
+          "coef": "paper_figure_10",
+          "label": "backup_temporal_head"
+        },
+        {
+          "layer": 29,
+          "head": 22,
+          "coef": "paper_figure_10",
+          "label": "backup_temporal_head"
+        }
+      ]
+    },
+    "phi3-mini-4k-instruct": {
+      "model": "microsoft/phi-3-mini-4k-instruct",
+      "top_heads": [
+        {
+          "layer": 10,
+          "head": 13,
+          "coef": "paper_table_2",
+          "label": "temporal_head"
+        },
+        {
+          "layer": 1,
+          "head": 6,
+          "coef": "paper_figure_11",
+          "label": "backup_temporal_head"
+        },
+        {
+          "layer": 4,
+          "head": 25,
+          "coef": "paper_figure_11",
+          "label": "backup_temporal_head"
+        },
+        {
+          "layer": 2,
+          "head": 0,
+          "coef": "paper_figure_11",
+          "label": "backup_temporal_head"
+        }
+      ]
+    }
+  }
+}

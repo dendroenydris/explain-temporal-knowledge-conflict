@@ -18,7 +18,9 @@ methodology:
 
 Prerequisites
 -------------
-  1. Run run_f1_diagnostic.py first to identify temporal_heads.
+  1. Provide temporal heads via --temporal-heads or --temporal-heads-manual.
+     For Phi-3, the default stage script uses the paper-derived list in
+     data/external/temporal_heads/paper_temporal_heads.json.
   2. Layer-2 JSONL must contain B1, B5, and B6 instance types.
      Build with:  python scripts/build_wikidata_layer2.py --layers B1 B3 B5 B6
 
@@ -27,7 +29,7 @@ Usage
     python scripts/run_f2_diagnostic.py \\
         --data  data/processed/wikidata_layer2.jsonl \\
         --model meta-llama/Llama-2-7b-chat-hf \\
-        --temporal-heads results/f1_diagnostic/f1a_sat_probe.json \\
+        --temporal-heads data/external/temporal_heads/paper_temporal_heads.json \\
         --out   results/f2_diagnostic/
 
     # Specify temporal heads manually (layer,head pairs):
@@ -153,13 +155,25 @@ def restrict_instances(
 def load_temporal_heads(
     probe_json: str,
     top_k: int = 10,
+    model_name: str | None = None,
 ) -> list[tuple[int, int]]:
-    """Read temporal heads from F1 SAT probe output JSON.
+    """Read temporal heads from a JSON file.
 
-    The file is ``f1a_sat_probe.json`` produced by ``run_f1_diagnostic.py``.
+    This supports both ``f1a_sat_probe.json`` with a top-level ``top_heads``
+    list and paper-derived files grouped by model under ``models``.
     """
     with open(probe_json) as f:
         data = json.load(f)
+
+    if "models" in data:
+        if not model_name:
+            raise ValueError(
+                f"{probe_json} contains multiple models. Pass --model so the "
+                "matching temporal-head entry can be selected."
+            )
+        model_key = _select_temporal_heads_model(data["models"], model_name, probe_json)
+        data = data["models"][model_key]
+
     heads = []
     for entry in data.get("top_heads", [])[:top_k]:
         if entry.get("coef", "0") not in ("0", "0.0000e+00"):
@@ -170,6 +184,33 @@ def load_temporal_heads(
             "Pass --temporal-heads-manual instead."
         )
     return heads
+
+
+def _select_temporal_heads_model(
+    model_entries: dict,
+    model_name: str,
+    source_path: str,
+) -> str:
+    """Select the temporal-head entry matching the requested model."""
+    requested = model_name.lower()
+    requested_short = requested.rsplit("/", 1)[-1]
+
+    for key, entry in model_entries.items():
+        candidates = {
+            key.lower(),
+            str(entry.get("model", "")).lower(),
+            str(entry.get("model", "")).lower().rsplit("/", 1)[-1],
+        }
+        if requested in candidates or requested_short in candidates:
+            return key
+
+    available = ", ".join(
+        str(entry.get("model", key)) for key, entry in model_entries.items()
+    )
+    raise ValueError(
+        f"No temporal heads for model {model_name!r} in {source_path}. "
+        f"Available models: {available}"
+    )
 
 
 # ── REVERTS_OLD filter ────────────────────────────────────────────────────────
@@ -500,7 +541,7 @@ def main():
                         help="HuggingFace model name (TransformerLens-compatible)")
     parser.add_argument(
         "--temporal-heads",
-        help="Path to f1a_sat_probe.json from run_f1_diagnostic.py",
+        help="Path to JSON file with top_heads or models, e.g. data/external/temporal_heads/paper_temporal_heads.json",
     )
     parser.add_argument(
         "--temporal-heads-manual", nargs="+", metavar="L,H",
@@ -547,7 +588,9 @@ def main():
         print(f"Temporal heads (manual): {temporal_heads}")
     elif args.temporal_heads:
         temporal_heads = load_temporal_heads(
-            args.temporal_heads, top_k=args.temporal_heads_top_k,
+            args.temporal_heads,
+            top_k=args.temporal_heads_top_k,
+            model_name=args.model,
         )
         print(f"Temporal heads (from probe, top-{args.temporal_heads_top_k}): {temporal_heads}")
     else:
