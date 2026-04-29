@@ -5,6 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
+#SBATCH --exclude=ga03
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/tatm_stage1_phi3_%j.out
 #SBATCH --error=logs/tatm_stage1_phi3_%j.err
