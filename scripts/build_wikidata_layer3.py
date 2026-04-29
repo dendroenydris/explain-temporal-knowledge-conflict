@@ -5,7 +5,8 @@ Layer 3 stores model-dependent answers for selected Layer-2 questions.  Unlike
 Layer 2, this file is tied to a specific model, template, and decoding setup.
 
 Default usage builds parametric answers from B1 questions without using their
-Layer-2 context.  Pass --use-context only when you intentionally want to cache
+Layer-2 context.  Prompts include a one-shot example to encourage concise
+answers.  Pass --use-context only when you intentionally want to cache
 context-conditioned answers.
 
     python scripts/build_wikidata_layer3.py \
@@ -29,10 +30,12 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "source"))
 
-from tatm.model import build_prompt, check_match, load_model  # noqa: E402
+from tatm.model import check_match, load_model  # noqa: E402
 
 DEFAULT_LAYER2 = REPO_ROOT / "data/processed/wikidata_layer2.jsonl"
 DEFAULT_OUT = REPO_ROOT / "data/processed/wikidata_layer3.jsonl"
+ONE_SHOT_QUESTION = "As of 2017, who was the head of government of United Kingdom?"
+ONE_SHOT_ANSWER = "Theresa May"
 
 
 def load_layer2(path: Path) -> list[dict]:
@@ -93,8 +96,71 @@ def _collect_eos_ids(tokenizer) -> list[int]:
     return eos
 
 
-def extract_answer(text: str) -> str:
-    """Extract the first short answer phrase from raw generated text."""
+def build_concise_prompt(
+    *,
+    context: str,
+    question: str,
+    template: str,
+) -> str:
+    """Build a one-shot prompt that asks for only the answer string."""
+    instruction = (
+        "Answer each question with only the person's or entity's name. "
+        "Do not explain."
+    )
+    if context.strip():
+        current = f"Context: {context}\n\nQuestion: {question}"
+    else:
+        current = f"Question: {question}"
+
+    if template == "phi3":
+        return (
+            f"<|system|>\n{instruction}<|end|>\n"
+            f"<|user|>\nQuestion: {ONE_SHOT_QUESTION}<|end|>\n"
+            f"<|assistant|>\n{ONE_SHOT_ANSWER}<|end|>\n"
+            f"<|user|>\n{current}<|end|>\n"
+            "<|assistant|>\n"
+        )
+    if template == "qwen":
+        return (
+            f"<|im_start|>system\n{instruction}<|im_end|>\n"
+            f"<|im_start|>user\nQuestion: {ONE_SHOT_QUESTION}<|im_end|>\n"
+            f"<|im_start|>assistant\n{ONE_SHOT_ANSWER}<|im_end|>\n"
+            f"<|im_start|>user\n{current}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+    if template == "llama2":
+        return (
+            "[INST] <<SYS>>\n"
+            f"{instruction}\n"
+            "<</SYS>>\n\n"
+            f"Question: {ONE_SHOT_QUESTION}\n"
+            f"Answer: {ONE_SHOT_ANSWER}\n\n"
+            f"{current} [/INST]"
+        )
+    if template == "llama3":
+        return (
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            f"{instruction}<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"Question: {ONE_SHOT_QUESTION}<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            f"{ONE_SHOT_ANSWER}<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"{current}<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+
+    return (
+        f"{instruction}\n\n"
+        f"Question: {ONE_SHOT_QUESTION}\n"
+        f"Answer: {ONE_SHOT_ANSWER}\n\n"
+        f"{current}\n"
+        "Answer:"
+    )
+
+
+def _strip_answer_text(text: str) -> str:
+    """Normalize raw model output before extracting a short answer."""
     text = text.strip()
     match = re.search(r"(?i)Answer\s*:\s*([^\n\r]+)", text)
     if match:
@@ -104,7 +170,57 @@ def extract_answer(text: str) -> str:
     for stop in ("<|", "[", "Instruction"):
         text = text.split(stop)[0]
     text = text.split(".")[0]
-    return text.strip()
+    return text.strip(" \t\r\n\"'")
+
+
+def _candidate_match(text: str, candidates: list[str]) -> str:
+    """Return a canonical candidate if the model output clearly mentions it."""
+    clean = text.lower()
+    sorted_candidates = sorted(
+        [candidate.strip() for candidate in candidates if candidate.strip()],
+        key=len,
+        reverse=True,
+    )
+    for candidate in sorted_candidates:
+        if candidate.lower() in clean:
+            return candidate
+    for candidate in sorted_candidates:
+        if check_match(text, candidate):
+            return candidate
+    return ""
+
+
+def extract_answer(text: str, candidates: list[str] | None = None) -> str:
+    """Extract the first short answer phrase from raw generated text."""
+    text = _strip_answer_text(text)
+    if candidates:
+        matched = _candidate_match(text, candidates)
+        if matched:
+            return matched
+
+    # Phi-3 often answers with "As of 2018, the ... was X"; keep only X.
+    text = re.sub(r"(?i)^as of\s+(?:19|20)\d{2},?\s*", "", text).strip()
+    text = re.sub(r"(?i)^the answer is\s+", "", text).strip()
+
+    prefix_match = re.match(
+        r"^(.+?)\s+(?:was|is|were|are)\s+(?:the|an?|officeholder|chairperson|head|ceo|director)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if prefix_match:
+        return prefix_match.group(1).strip(" ,")
+
+    suffix_match = re.search(
+        r"\b(?:was|is|were|are)\s+(?:President|Prime Minister|CEO|Dr\.?\s+|Professor\s+)?(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if suffix_match:
+        text = suffix_match.group(1).strip(" ,")
+
+    text = re.split(r",\s+(?:who|which|the|a)\b", text, maxsplit=1)[0]
+    text = re.split(r"\s+-\s+", text, maxsplit=1)[0]
+    return text.strip(" ,")
 
 
 def generate_raw_answer(model, prompt: str, max_new_tokens: int) -> str:
@@ -161,7 +277,7 @@ def main() -> None:
         help="Randomly sample N Layer-1 facts and keep all selected Layer-2 instances",
     )
     parser.add_argument("--sample-seed", type=int, default=42)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument(
         "--use-context",
         action="store_true",
@@ -207,6 +323,7 @@ def main() -> None:
     print(f"Model         : {args.model}")
     print(f"Template      : {args.template}")
     print(f"Use context   : {args.use_context}")
+    print("Prompt style  : one-shot concise answer")
     print(f"Selected rows : {len(records)}")
 
     print(f"\nLoading model {args.model} ...")
@@ -216,13 +333,19 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as fh:
         for record in tqdm(records, desc="Generating Layer-3", unit="inst", dynamic_ncols=True):
             prompt_context = record.get("context", "") if args.use_context else ""
-            prompt = build_prompt(
+            prompt = build_concise_prompt(
                 context=prompt_context,
                 question=record.get("question", ""),
                 template=args.template,
             )
             raw = generate_raw_answer(model, prompt, max_new_tokens=args.max_new_tokens)
-            extracted = extract_answer(raw)
+            extracted = extract_answer(
+                raw,
+                candidates=[
+                    record.get("answer_old", ""),
+                    record.get("answer_new", ""),
+                ],
+            )
             output = {
                 "layer3_id": f"L3_{tag}_{record.get('instance_id', '')}",
                 "instance_id": record.get("instance_id", ""),
@@ -232,6 +355,7 @@ def main() -> None:
                 "template": args.template,
                 "question": record.get("question", ""),
                 "uses_context": args.use_context,
+                "prompt_style": "one_shot_concise_answer",
                 "context": prompt_context,
                 "prompt": prompt,
                 "model_output_raw": raw,

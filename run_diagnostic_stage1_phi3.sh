@@ -20,6 +20,7 @@ MODEL="${MODEL:-microsoft/phi-3-mini-4k-instruct}"
 MODEL_TAG="${MODEL_TAG:-phi3}"
 TEMPLATE="${TEMPLATE:-phi3}"
 OUT_DIR="${OUT_DIR:-results/f1_diagnostic_1000_${MODEL_TAG}}"
+LAYER3_JSONL="${LAYER3_JSONL:-data/processed/wikidata_layer3_${MODEL_TAG}_1000.jsonl}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 
 command -v conda >/dev/null || {
@@ -37,6 +38,13 @@ conda activate "${CONDA_ENV_NAME}"
   exit 1
 }
 
+[ -f "${LAYER3_JSONL}" ] || {
+  echo "[ERROR] Missing Layer-3 parametric answer file: ${LAYER3_JSONL}" >&2
+  echo "Build it first, for example:" >&2
+  echo "  LAYERS=B5 sbatch build_wikidata_layer3_1000.sh" >&2
+  exit 1
+}
+
 ARGS=()
 if [ -n "${MAX_INSTANCES:-}" ]; then
   ARGS+=(--max-instances "${MAX_INSTANCES}")
@@ -51,6 +59,7 @@ fi
 echo "MODEL=${MODEL}"
 echo "MODEL_TAG=${MODEL_TAG}"
 echo "TEMPLATE=${TEMPLATE}"
+echo "LAYER3_JSONL=${LAYER3_JSONL}"
 echo "OUT_DIR=${OUT_DIR}"
 
 python scripts/run_f1_diagnostic.py \
@@ -58,8 +67,10 @@ python scripts/run_f1_diagnostic.py \
   --model "${MODEL}" \
   --template "${TEMPLATE}" \
   --out "${OUT_DIR}" \
+  --layer3 "${LAYER3_JSONL}" \
   --b5 \
-  "${ARGS[@]}"
+  "${ARGS[@]}" \
+  "$@"
 
 python - <<PY
 from pathlib import Path

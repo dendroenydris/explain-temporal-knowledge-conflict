@@ -45,7 +45,6 @@ from tatm.model import (
     build_prompt,
     check_match,
     find_year_positions,
-    generate_answer,
     get_first_answer_token,
     load_model,
 )
@@ -194,54 +193,87 @@ def restrict_instances(
     )
 
 
+def load_layer3_answers(path: str) -> dict[str, dict]:
+    """Load Layer-3 parametric answers keyed by Layer-2 instance_id."""
+    layer3_path = Path(path)
+    if not layer3_path.exists():
+        raise FileNotFoundError(
+            f"Layer-3 parametric answer file not found: {layer3_path}. "
+            "Build it first with build_wikidata_layer3_1000.sh."
+        )
+
+    answers: dict[str, dict] = {}
+    with open(layer3_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            iid = row.get("instance_id")
+            if iid:
+                answers[str(iid)] = row
+    if not answers:
+        raise ValueError(f"No Layer-3 answers found in {layer3_path}")
+    return answers
+
+
 # ── A1: Parametric memory filter ─────────────────────────────────────────────
 
 def run_a1_filter(
-    model,
     b1_instances: list[dict],
     b3_instances: list[dict],
-    template: str,
     out_dir: Path,
+    layer3_answers: dict[str, dict],
     strong_label: str = "B1",
     weak_label: str = "B3",
 ) -> tuple[list[dict], list[dict]]:
-    """Run A1 (explicit year, no context) to keep only instances the model
-    cannot answer from parametric memory alone.
+    """Use cached Layer-3 answers to keep instances the model cannot answer
+    from parametric memory alone.
 
     Filtering criterion
     -------------------
-    A1_KNOWS_NEW  : A1 outputs answer_new  → exclude (year cue alone is enough)
-    A1_WRONG      : A1 outputs other       → keep (evidence is genuinely needed)
+    L3_KNOWS_NEW  : Layer-3 answer matches answer_new  → exclude
+    L3_WRONG      : Layer-3 answer is other             → keep
     """
-    import gc
-
     print("\n" + "=" * 60)
-    print("A1: Year-conditioned Parametric Memory Profiling")
+    print("Layer-3: Year-conditioned Parametric Memory Profiling")
     print("=" * 60)
-    print("Prompt: question WITH year, WITHOUT context")
+    print("Source: cached Layer-3 answers, question WITH year, WITHOUT context")
     print("Keeping instances where model does NOT output answer_new")
     print(f"(i.e., evidence passage is genuinely needed for {strong_label} to succeed)\n")
 
     knows_new_ids: set[str] = set()
     a1_log = []
+    missing_ids: list[str] = []
 
     bar = tqdm(b1_instances, desc="A1  parametric", unit="inst", dynamic_ncols=True)
     for inst in bar:
         question   = inst.get("question", "")
         answer_new = inst.get("answer_new", "")
+        answer_old = inst.get("answer_old", "")
         iid        = inst.get("instance_id", "")
 
-        # A1: question with year cue intact, but NO context
-        prompt    = build_prompt("", question, template=template)
-        generated = generate_answer(model, prompt)
-        already_knows = check_match(generated, answer_new)
+        layer3_row = layer3_answers.get(iid)
+        if layer3_row is None:
+            missing_ids.append(iid)
+            continue
+
+        generated = layer3_row.get("extracted_answer") or layer3_row.get("model_output_raw", "")
+        already_knows = bool(
+            layer3_row.get("matches_answer_new")
+            if "matches_answer_new" in layer3_row
+            else check_match(generated, answer_new)
+        )
 
         a1_log.append({
             "instance_id": iid,
             "question":    question,
             "generated":   generated,
+            "model_output_raw": layer3_row.get("model_output_raw", ""),
+            "answer_old":  answer_old,
             "answer_new":  answer_new,
             "knows_new":   already_knows,
+            "layer3_id":   layer3_row.get("layer3_id", ""),
         })
 
         if already_knows:
@@ -253,9 +285,13 @@ def run_a1_filter(
             refresh=True,
         )
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+    if missing_ids:
+        preview = ", ".join(missing_ids[:5])
+        raise ValueError(
+            f"Layer-3 file is missing {len(missing_ids)} {strong_label} parametric "
+            f"answers required by A1 filter. Examples: {preview}. "
+            f"Rebuild Layer-3 with LAYERS={strong_label}."
+        )
 
     n_total   = len(b1_instances)
     n_known   = len(knows_new_ids)
@@ -795,6 +831,13 @@ def main():
     )
     parser.add_argument("--template", default="plain", choices=["plain", "llama2", "llama3", "phi3"])
     parser.add_argument("--out", default="results/f1_diagnostic", help="Output directory")
+    parser.add_argument(
+        "--layer3",
+        help=(
+            "Layer-3 JSONL with cached parametric answers. Required unless "
+            "--no-a1-filter is used."
+        ),
+    )
     parser.add_argument("--device", default="auto", help="cuda | mps | cpu | auto")
     parser.add_argument(
         "--dtype", default="auto", choices=["auto", "float16", "float32", "bfloat16"],
@@ -849,6 +892,7 @@ def main():
 
     print(f"Model:    {args.model}")
     print(f"Data:     {args.data}")
+    print(f"Layer3:   {args.layer3 or '(not provided)'}")
     print(f"Template: {args.template}")
     print(f"Device:   {args.device}")
     print(f"Output:   {out_dir}")
@@ -869,6 +913,17 @@ def main():
     weak_label   = "B6" if args.b5 else "B3"
     print(f"\nLoaded {len(b1_instances)} {strong_label} instances, {len(b3_instances)} {weak_label} instances")
 
+    layer3_answers: dict[str, dict] = {}
+    if not args.no_a1_filter:
+        if not args.layer3:
+            raise SystemExit(
+                "[ERROR] --layer3 is required for the A1 parametric filter. "
+                "Build it first with build_wikidata_layer3_1000.sh, or use "
+                "--no-a1-filter for debugging."
+            )
+        layer3_answers = load_layer3_answers(args.layer3)
+        print(f"Loaded {len(layer3_answers)} cached Layer-3 parametric answers")
+
     # load model
     print(f"\nLoading model {args.model}  (this may take 1–3 min on first run)…")
     with tqdm(total=1, desc="Loading weights", unit="model",
@@ -882,7 +937,7 @@ def main():
     # A1 filter: exclude instances where year cue alone is enough (default ON)
     if not args.no_a1_filter:
         b1_instances, b3_instances = run_a1_filter(
-            model, b1_instances, b3_instances, args.template, out_dir,
+            b1_instances, b3_instances, out_dir, layer3_answers,
             strong_label=strong_label, weak_label=weak_label,
         )
         if not b1_instances:
