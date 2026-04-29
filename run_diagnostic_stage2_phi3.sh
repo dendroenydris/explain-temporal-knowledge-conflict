@@ -28,11 +28,8 @@ echo "ARCH=${ARCH}"
 echo "VENV_DIR=${VENV_DIR}"
 
 if [ ! -f "${VENV_DIR}/bin/activate" ]; then
-  command -v python3 >/dev/null || {
-    echo "[ERROR] python3 not found." >&2
-    exit 1
-  }
-  python3 -m venv "${VENV_DIR}"
+  echo "[ERROR] venv not found: ${VENV_DIR}. Create it on the login node first, or submit with VENV_DIR=.venv." >&2
+  exit 1
 fi
 
 source "${VENV_DIR}/bin/activate"
