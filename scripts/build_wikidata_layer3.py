@@ -169,7 +169,6 @@ def _strip_answer_text(text: str) -> str:
         text = text.split("\n")[0]
     for stop in ("<|", "[", "Instruction"):
         text = text.split(stop)[0]
-    text = text.split(".")[0]
     return text.strip(" \t\r\n\"'")
 
 
@@ -202,25 +201,70 @@ def extract_answer(text: str, candidates: list[str] | None = None) -> str:
     text = re.sub(r"(?i)^as of\s+(?:19|20)\d{2},?\s*", "", text).strip()
     text = re.sub(r"(?i)^the answer is\s+", "", text).strip()
 
-    prefix_match = re.match(
-        r"^(.+?)\s+(?:was|is|were|are)\s+(?:the|an?|officeholder|chairperson|head|ceo|director)\b",
+    subject_answer_match = re.match(
+        r"^(.+?)\s+(?:was|is|were|are)\s+(?:the\s+)?"
+        r"(?:head|officeholder|chairperson|ceo|chief executive officer|"
+        r"director|manager|president|prime minister)\b",
         text,
         flags=re.IGNORECASE,
     )
-    if prefix_match:
-        return prefix_match.group(1).strip(" ,")
+    if subject_answer_match:
+        candidate = subject_answer_match.group(1).strip(" ,")
+        if not re.match(
+            r"(?i)^(?:the\s+)?(?:current\s+)?"
+            r"(?:officeholder|chairperson|head|ceo|chief executive officer|"
+            r"director|manager|president|prime minister)\b",
+            candidate,
+        ):
+            return _trim_answer_tail(candidate)
 
-    suffix_match = re.search(
-        r"\b(?:was|is|were|are)\s+(?:President|Prime Minister|CEO|Dr\.?\s+|Professor\s+)?(.+)$",
+    predicate_match = re.search(
+        r"\b(?:was|is|were|are)\s+(?!associated\b)(?:named\s+|called\s+)?(.+)$",
         text,
         flags=re.IGNORECASE,
     )
-    if suffix_match:
-        text = suffix_match.group(1).strip(" ,")
+    if predicate_match:
+        text = predicate_match.group(1).strip(" ,")
+        text = re.sub(
+            r"(?i)^(?:the\s+)?(?:current\s+)?"
+            r"(?:officeholder|chairperson|head(?:\s+of\s+(?:government|state))?|"
+            r"ceo|chief executive officer|director|manager|president|prime minister)\s+"
+            r"(?:of|for|associated with|was|is)?\s*",
+            "",
+            text,
+        ).strip(" ,")
 
+    return _trim_answer_tail(text)
+
+
+def _trim_answer_tail(text: str) -> str:
+    """Trim explanation tails without cutting honorifics like ``Rt Hon.``."""
+    text = text.strip(" \t\r\n\"'")
     text = re.split(r",\s+(?:who|which|the|a)\b", text, maxsplit=1)[0]
     text = re.split(r"\s+-\s+", text, maxsplit=1)[0]
-    return text.strip(" ,")
+    text = re.split(
+        r"\s+(?:who|which)\s+(?:is|was|were|are)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    text = re.split(
+        r"\s+(?:as|because|since)\s+(?:of|the|a|an)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+
+    # Only treat a period as a sentence boundary when it is not part of a known
+    # title/honorific and is followed by whitespace plus a new sentence.
+    sentence_boundary = re.search(
+        r"(?<!\bDr)(?<!\bMr)(?<!\bMs)(?<!\bMrs)(?<!\bProf)(?<!\bHon)(?<!\bRt Hon)\.\s+[A-Z]",
+        text,
+    )
+    if sentence_boundary:
+        text = text[: sentence_boundary.start() + 1]
+
+    return text.strip(" ,.")
 
 
 def generate_raw_answer(model, prompt: str, max_new_tokens: int) -> str:
