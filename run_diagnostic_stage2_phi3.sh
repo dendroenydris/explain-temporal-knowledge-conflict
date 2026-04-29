@@ -21,20 +21,15 @@ TEMPLATE="${TEMPLATE:-phi3}"
 F1_OUT_DIR="${F1_OUT_DIR:-results/f1_diagnostic_1000_${MODEL_TAG}}"
 OUT_DIR="${OUT_DIR:-results/f2_diagnostic_1000_${MODEL_TAG}}"
 TEMPORAL_HEADS="${TEMPORAL_HEADS:-${F1_OUT_DIR}/f1a_sat_probe.json}"
-ARCH="$(uname -m)"
-VENV_DIR="${VENV_DIR:-.venv-${ARCH}}"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 
-echo "ARCH=${ARCH}"
-echo "VENV_DIR=${VENV_DIR}"
-
-if [ ! -f "${VENV_DIR}/bin/activate" ]; then
-  echo "[ERROR] venv not found: ${VENV_DIR}. Create it on the login node first, or submit with VENV_DIR=.venv." >&2
+command -v conda >/dev/null || {
+  echo "[ERROR] conda not found. Run setup-conda3 on the cluster, then create ${CONDA_ENV_NAME} from environment.yml." >&2
   exit 1
-fi
+}
 
-source "${VENV_DIR}/bin/activate"
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+eval "$(conda shell.bash hook)"
+conda activate "${CONDA_ENV_NAME}"
 
 [ -f "${DATA_JSONL}" ] || {
   echo "[ERROR] Missing data file: ${DATA_JSONL}" >&2
