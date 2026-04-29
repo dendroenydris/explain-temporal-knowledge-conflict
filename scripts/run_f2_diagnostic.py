@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random as _random
 import sys
 from pathlib import Path
 
@@ -103,6 +104,50 @@ def load_b1_b5_b6(path: str) -> tuple[list[dict], list[dict], list[dict]]:
             b6_aligned.append(b6_map[key])
 
     return b1_aligned, b5_aligned, b6_aligned
+
+
+def restrict_instances(
+    b1_instances: list[dict],
+    b5_instances: list[dict],
+    b6_instances: list[dict],
+    *,
+    number: int | None = None,
+    seed: int = 42,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Randomly sample Layer-1 facts and keep all aligned B1/B5/B6 triples."""
+    if number is None:
+        return b1_instances, b5_instances, b6_instances
+    if number < 1:
+        raise ValueError("--number must be >= 1")
+
+    n_triples = min(len(b1_instances), len(b5_instances), len(b6_instances))
+    b1_instances = b1_instances[:n_triples]
+    b5_instances = b5_instances[:n_triples]
+    b6_instances = b6_instances[:n_triples]
+
+    fact_ids = sorted({
+        str(inst.get("fact_id") or idx)
+        for idx, inst in enumerate(b5_instances)
+    })
+    if number >= len(fact_ids):
+        return (
+            b1_instances[:n_triples],
+            b5_instances[:n_triples],
+            b6_instances[:n_triples],
+        )
+
+    rng = _random.Random(seed)
+    selected_fact_ids = set(rng.sample(fact_ids, number))
+    indices = [
+        idx
+        for idx, inst in enumerate(b5_instances)
+        if str(inst.get("fact_id") or idx) in selected_fact_ids
+    ]
+    return (
+        [b1_instances[i] for i in indices],
+        [b5_instances[i] for i in indices],
+        [b6_instances[i] for i in indices],
+    )
 
 
 def load_temporal_heads(
@@ -475,6 +520,14 @@ def main():
     parser.add_argument("--max-instances", type=int, default=None,
                         help="Limit number of instances (quick testing)")
     parser.add_argument(
+        "-n", "--number", type=int, default=None,
+        help="Randomly sample N Layer-1 facts and keep all aligned B1/B5/B6 Layer-2 triples",
+    )
+    parser.add_argument(
+        "--sample-seed", type=int, default=42,
+        help="Random seed used with --number (default: 42)",
+    )
+    parser.add_argument(
         "--skip", nargs="*", default=[], choices=["f2a", "f2b", "f2c"],
         help="Skip sub-experiments",
     )
@@ -538,6 +591,14 @@ def main():
         b1_instances = b1_instances[:args.max_instances]
         b5_instances = b5_instances[:args.max_instances]
         b6_instances = b6_instances[:args.max_instances]
+    if args.number:
+        b1_instances, b5_instances, b6_instances = restrict_instances(
+            b1_instances,
+            b5_instances,
+            b6_instances,
+            number=args.number,
+            seed=args.sample_seed,
+        )
 
     print(f"\nLoaded (aligned): B1={len(b1_instances)}, B5={len(b5_instances)}, "
           f"B6={len(b6_instances)}")

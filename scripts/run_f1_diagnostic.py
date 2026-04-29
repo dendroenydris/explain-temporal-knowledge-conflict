@@ -164,18 +164,30 @@ def restrict_instances(
     number: int | None = None,
     seed: int = 42,
 ) -> tuple[list[dict], list[dict]]:
-    """Randomly sample aligned strong/weak instance pairs."""
+    """Randomly sample Layer-1 facts and keep all aligned Layer-2 pairs."""
     if number is None:
         return strong_instances, weak_instances
     if number < 1:
         raise ValueError("--number must be >= 1")
 
     n_pairs = min(len(strong_instances), len(weak_instances))
-    if number >= n_pairs:
+    strong_instances = strong_instances[:n_pairs]
+    weak_instances = weak_instances[:n_pairs]
+
+    fact_ids = sorted({
+        str(inst.get("fact_id") or inst.get("id") or idx)
+        for idx, inst in enumerate(strong_instances)
+    })
+    if number >= len(fact_ids):
         return strong_instances[:n_pairs], weak_instances[:n_pairs]
 
     rng = _random.Random(seed)
-    indices = sorted(rng.sample(range(n_pairs), number))
+    selected_fact_ids = set(rng.sample(fact_ids, number))
+    indices = [
+        idx
+        for idx, inst in enumerate(strong_instances)
+        if str(inst.get("fact_id") or inst.get("id") or idx) in selected_fact_ids
+    ]
     return (
         [strong_instances[i] for i in indices],
         [weak_instances[i] for i in indices],
@@ -791,7 +803,7 @@ def main():
     parser.add_argument("--max-instances", type=int, default=None, help="Limit instances for quick testing")
     parser.add_argument(
         "-n", "--number", type=int, default=None,
-        help="Randomly sample N aligned strong/weak instance pairs after loading the dataset",
+        help="Randomly sample N Layer-1 facts and keep all aligned strong/weak Layer-2 pairs",
     )
     parser.add_argument(
         "--sample-seed", type=int, default=42,

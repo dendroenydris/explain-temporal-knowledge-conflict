@@ -46,6 +46,12 @@ ARGS=()
 if [ -n "${MAX_INSTANCES:-}" ]; then
   ARGS+=(--max-instances "${MAX_INSTANCES}")
 fi
+if [ -n "${NUMBER:-}" ]; then
+  ARGS+=(--number "${NUMBER}")
+fi
+if [ -n "${SAMPLE_SEED:-}" ]; then
+  ARGS+=(--sample-seed "${SAMPLE_SEED}")
+fi
 
 echo "MODEL=${MODEL}"
 echo "MODEL_TAG=${MODEL_TAG}"
