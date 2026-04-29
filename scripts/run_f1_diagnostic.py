@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random as _random
 import sys
 from pathlib import Path
 
@@ -154,6 +155,31 @@ def _load_raw(records: list[dict]) -> tuple[list[dict], list[dict]]:
         b3_list.append(b3)
 
     return b1_list, b3_list
+
+
+def restrict_instances(
+    strong_instances: list[dict],
+    weak_instances: list[dict],
+    *,
+    number: int | None = None,
+    seed: int = 42,
+) -> tuple[list[dict], list[dict]]:
+    """Randomly sample aligned strong/weak instance pairs."""
+    if number is None:
+        return strong_instances, weak_instances
+    if number < 1:
+        raise ValueError("--number must be >= 1")
+
+    n_pairs = min(len(strong_instances), len(weak_instances))
+    if number >= n_pairs:
+        return strong_instances[:n_pairs], weak_instances[:n_pairs]
+
+    rng = _random.Random(seed)
+    indices = sorted(rng.sample(range(n_pairs), number))
+    return (
+        [strong_instances[i] for i in indices],
+        [weak_instances[i] for i in indices],
+    )
 
 
 # ── A1: Parametric memory filter ─────────────────────────────────────────────
@@ -405,8 +431,6 @@ def run_f1b(model, b1_instances, b3_instances, y_labels, top_heads, template, ou
 
 
 # ── F1-c helpers ─────────────────────────────────────────────────────────────
-
-import random as _random
 
 def _sample_random_positions(
     seq_len: int,
@@ -766,6 +790,14 @@ def main():
     )
     parser.add_argument("--max-instances", type=int, default=None, help="Limit instances for quick testing")
     parser.add_argument(
+        "-n", "--number", type=int, default=None,
+        help="Randomly sample N aligned strong/weak instance pairs after loading the dataset",
+    )
+    parser.add_argument(
+        "--sample-seed", type=int, default=42,
+        help="Random seed used with --number (default: 42)",
+    )
+    parser.add_argument(
         "--skip", nargs="*", default=[], choices=["f1a", "f1b", "f1c"],
         help="Skip specific sub-experiments",
     )
@@ -814,6 +846,13 @@ def main():
     if args.max_instances:
         b1_instances = b1_instances[:args.max_instances]
         b3_instances = b3_instances[:args.max_instances]
+    if args.number:
+        b1_instances, b3_instances = restrict_instances(
+            b1_instances,
+            b3_instances,
+            number=args.number,
+            seed=args.sample_seed,
+        )
     strong_label = "B5" if args.b5 else "B1"
     weak_label   = "B6" if args.b5 else "B3"
     print(f"\nLoaded {len(b1_instances)} {strong_label} instances, {len(b3_instances)} {weak_label} instances")
