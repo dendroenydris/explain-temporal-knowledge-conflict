@@ -20,6 +20,7 @@ LAYER3_JSONL="${LAYER3_JSONL:-data/processed/wikidata_layer3_phi3_1000.jsonl}"
 MODEL="${MODEL:-microsoft/phi-3-mini-4k-instruct}"
 MODEL_TAG="${MODEL_TAG:-phi3}"
 TEMPLATE="${TEMPLATE:-phi3}"
+DTYPE="${DTYPE:-float32}"
 OUT_DIR="${OUT_DIR:-results/f3_diagnostic_1000_${MODEL_TAG}}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 
@@ -54,6 +55,12 @@ fi
 if [ -n "${SAMPLE_SEED:-}" ]; then
   ARGS+=(--sample-seed "${SAMPLE_SEED}")
 fi
+if [ -n "${ROUGE_THRESHOLD:-}" ]; then
+  ARGS+=(--rouge-threshold "${ROUGE_THRESHOLD}")
+fi
+if [ -n "${ROUGE_MARGIN:-}" ]; then
+  ARGS+=(--rouge-margin "${ROUGE_MARGIN}")
+fi
 if [ -n "${SKIP:-}" ]; then
   # shellcheck disable=SC2206
   ARGS+=(--skip ${SKIP})
@@ -61,8 +68,8 @@ fi
 if [ "${INCLUDE_SUCCESS:-0}" = "1" ]; then
   ARGS+=(--include-success)
 fi
-if [ "${INCLUDE_CONTROL:-0}" = "1" ]; then
-  ARGS+=(--include-control)
+if [ "${NO_CONTROL:-0}" = "1" ]; then
+  ARGS+=(--no-control)
 fi
 if [ "${NO_B1_BEHAVIOR:-0}" = "1" ]; then
   ARGS+=(--no-b1-behavior)
@@ -77,6 +84,7 @@ fi
 echo "MODEL=${MODEL}"
 echo "MODEL_TAG=${MODEL_TAG}"
 echo "TEMPLATE=${TEMPLATE}"
+echo "DTYPE=${DTYPE}"
 echo "DATA_JSONL=${DATA_JSONL}"
 echo "LAYER3_JSONL=${LAYER3_JSONL}"
 echo "OUT_DIR=${OUT_DIR}"
@@ -86,6 +94,7 @@ python scripts/run_f3_diagnostic.py \
   --layer3 "${LAYER3_JSONL}" \
   --model "${MODEL}" \
   --template "${TEMPLATE}" \
+  --dtype "${DTYPE}" \
   --out "${OUT_DIR}" \
   "${ARGS[@]}" \
   "$@"

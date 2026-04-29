@@ -29,6 +29,10 @@ class F3PreparedInstance:
     tok_new: int
     tok_param: int
     b1_success: bool | None = None
+    b1_outputs_param: bool | None = None
+    b1_ambiguous: bool = False
+    b1_rouge_new: float | None = None
+    b1_rouge_param: float | None = None
 
     @property
     def instance_id(self) -> str:
@@ -165,6 +169,70 @@ def _cache_b1(
             prepend_bos=False,
         )
     return prompt, tokens, logits, cache
+
+
+def build_f3_pair_prompts(
+    *,
+    context: str,
+    question: str,
+    template: str,
+) -> tuple[str, str]:
+    """Build A1/B1 prompts with identical template wrappers for F3-c.
+
+    The only intended semantic difference is that B1 includes the evidence
+    context while A1 asks the same year-conditioned question without context.
+    """
+    instruction = "Answer the question. Give a short, direct answer."
+    a1_user = f"Question: {question}"
+    b1_user = f"Context: {context}\n\nQuestion: {question}"
+
+    if template == "phi3":
+        return (
+            f"<|system|>\n{instruction}<|end|>\n"
+            f"<|user|>\n{a1_user}<|end|>\n"
+            "<|assistant|>\n",
+            f"<|system|>\n{instruction}<|end|>\n"
+            f"<|user|>\n{b1_user}<|end|>\n"
+            "<|assistant|>\n",
+        )
+    if template == "qwen":
+        return (
+            f"<|im_start|>system\n{instruction}<|im_end|>\n"
+            f"<|im_start|>user\n{a1_user}<|im_end|>\n"
+            "<|im_start|>assistant\n",
+            f"<|im_start|>system\n{instruction}<|im_end|>\n"
+            f"<|im_start|>user\n{b1_user}<|im_end|>\n"
+            "<|im_start|>assistant\n",
+        )
+    if template == "llama2":
+        return (
+            "[INST] <<SYS>>\n"
+            f"{instruction}\n"
+            "<</SYS>>\n\n"
+            f"{a1_user} [/INST]",
+            "[INST] <<SYS>>\n"
+            f"{instruction}\n"
+            "<</SYS>>\n\n"
+            f"{b1_user} [/INST]",
+        )
+    if template == "llama3":
+        return (
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            f"{instruction}<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"{a1_user}<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            f"{instruction}<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"{b1_user}<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        )
+
+    return (
+        f"{instruction}\n\n{a1_user}\nAnswer:",
+        f"{instruction}\n\n{b1_user}\nAnswer:",
+    )
 
 
 def run_f3a_dla(
@@ -316,8 +384,11 @@ def run_f3c_dual_trajectory(
     n_layers = model.cfg.n_layers
 
     for inst in tqdm(instances, desc="F3-c A1/B1 trajectory", unit="inst", dynamic_ncols=True):
-        a1_prompt = build_prompt("", str(inst.row.get("question", "")), template=template)
-        b1_prompt = build_prompt(str(inst.row.get("context", "")), str(inst.row.get("question", "")), template=template)
+        a1_prompt, b1_prompt = build_f3_pair_prompts(
+            context=str(inst.row.get("context", "")),
+            question=str(inst.row.get("question", "")),
+            template=template,
+        )
         a1_traj = run_logit_lens(model, _tokens(model, a1_prompt), inst.tok_new, inst.tok_param)
         b1_traj = run_logit_lens(model, _tokens(model, b1_prompt), inst.tok_new, inst.tok_param)
         ld_a1 = a1_traj.logits_new - a1_traj.logits_old
