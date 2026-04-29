@@ -10,8 +10,19 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+  PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
+else
+  SCRIPT_DIR_FALLBACK="$(cd "$(dirname "$0")" && pwd)"
+  PROJECT_ROOT="$(cd "${SCRIPT_DIR_FALLBACK}/.." && pwd)"
+fi
+SCRIPT_DIR="${PROJECT_ROOT}/container"
+
+if [ ! -f "${PROJECT_ROOT}/requirements.txt" ] || [ ! -f "${SCRIPT_DIR}/Dockerfile.diagnostic" ]; then
+  echo "[ERROR] Submit this job from the project root, e.g. cd ~/kc && sbatch container/build_diagnostic_image.sh" >&2
+  echo "PROJECT_ROOT=${PROJECT_ROOT}" >&2
+  exit 1
+fi
 
 IMAGE_TAG="${IMAGE_TAG:-kc-diagnostic:latest}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io#nvidia/pytorch:24.07-py3}"
