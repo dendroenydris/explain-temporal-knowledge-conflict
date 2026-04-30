@@ -4,6 +4,7 @@
 Inputs:
   - Layer-2 JSONL with B1 instances.
   - Layer-3 JSONL with cached parametric answers.
+  - Optional Layer-4 JSONL with cached B1 behavior labels.
 
 Outputs:
   - f3_manifest.json
@@ -84,6 +85,89 @@ def restrict_by_fact(
         return instances
     selected = set(random.Random(seed).sample(fact_ids, number))
     return [row for row in instances if str(row.get("fact_id") or row.get("instance_id")) in selected]
+
+
+def layer_key(row: dict) -> tuple[str, object, object]:
+    return (str(row.get("fact_id", "")), row.get("t_old"), row.get("t_new"))
+
+
+def load_layer4(path: str) -> tuple[dict[str, dict], dict[tuple[str, object, object], dict]]:
+    by_id: dict[str, dict] = {}
+    by_key: dict[tuple[str, object, object], dict] = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if str(row.get("layer2_type", "")) != "B1":
+                continue
+            iid = str(row.get("instance_id", ""))
+            if iid:
+                by_id[iid] = row
+            key = layer_key(row)
+            if key[0]:
+                by_key[key] = row
+    return by_id, by_key
+
+
+def apply_layer4_behavior(
+    instances: list[F3PreparedInstance],
+    *,
+    layer4_by_id: dict[str, dict],
+    layer4_by_key: dict[tuple[str, object, object], dict],
+    out_dir: Path,
+) -> None:
+    log: list[dict] = []
+    missing: list[str] = []
+    for inst in instances:
+        row = layer4_by_id.get(inst.instance_id)
+        if row is None:
+            row = layer4_by_key.get(layer_key(inst.row))
+        if row is None:
+            missing.append(inst.instance_id)
+            continue
+
+        inst.b1_success = row.get("b_success")
+        inst.b1_outputs_param = row.get("b_outputs_param")
+        inst.b1_ambiguous = bool(row.get("b_ambiguous", False))
+        inst.b1_rouge_new = row.get("rougeL_answer_new")
+        inst.b1_rouge_param = row.get("rougeL_a_param")
+        log.append({
+            "instance_id": inst.instance_id,
+            "param_class": inst.param_class,
+            "generated": row.get("generated") or row.get("model_output_raw", ""),
+            "answer_new": row.get("answer_new", ""),
+            "a_param": row.get("a_param", inst.a_param),
+            "rougeL_answer_new": row.get("rougeL_answer_new"),
+            "rougeL_a_param": row.get("rougeL_a_param"),
+            "rougeL_threshold": row.get("rougeL_threshold"),
+            "rougeL_margin": row.get("rougeL_margin"),
+            "b1_success": inst.b1_success,
+            "b1_outputs_param": inst.b1_outputs_param,
+            "b1_ambiguous": inst.b1_ambiguous,
+            "layer4_id": row.get("layer4_id", ""),
+        })
+
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise ValueError(
+            f"Layer-4 is missing {len(missing)} B1 behavior rows required by F3. "
+            f"Examples: {preview}. Rebuild Layer-4 with LAYERS=B1."
+        )
+
+    with open(out_dir / "f3_b1_behavior.json", "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "n": len(log),
+                "source": "layer4",
+                "metric": "rougeL_f1",
+                "log": log,
+            },
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
 
 
 def _rouge_tokens(text: str) -> list[str]:
@@ -347,10 +431,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="F3 Diagnostic — Parametric Override")
     parser.add_argument("--data", required=True, help="Layer-2 JSONL with B1 instances")
     parser.add_argument("--layer3", required=True, help="Layer-3 JSONL with cached parametric answers")
+    parser.add_argument("--layer4", help="Layer-4 JSONL with cached B1 behavior labels")
     parser.add_argument("--model", default="microsoft/phi-3-mini-4k-instruct")
     parser.add_argument("--template", default="phi3", choices=["plain", "llama2", "llama3", "phi3", "qwen"])
     parser.add_argument("--out", default="results/f3_diagnostic")
     parser.add_argument("--device", default="auto", help="cuda | mps | cpu | auto")
+    parser.add_argument(
+        "--allow-cpu",
+        action="store_true",
+        help="Allow F3 to run on CPU. Default is to fail fast because Phi-3 F3 is impractically slow on CPU.",
+    )
     parser.add_argument("--dtype", default="float32", choices=["auto", "float16", "float32", "bfloat16"])
     parser.add_argument("--max-instances", type=int, default=None)
     parser.add_argument("-n", "--number", type=int, default=None)
@@ -416,7 +506,17 @@ def main() -> None:
 
     print(f"\nLoading model {args.model} ...")
     model = load_model(args.model, device=args.device, dtype=resolved_dtype)
+    model_device = str(model.cfg.device)
+    if model_device == "cpu" and not args.allow_cpu:
+        raise SystemExit(
+            "[ERROR] F3 loaded the model on CPU. This is usually caused by CUDA "
+            "being unavailable or the PyTorch CUDA build being newer than the "
+            "node driver. F3 on Phi-3 CPU can appear stuck for hours. Use a GPU "
+            "node with a compatible driver/PyTorch build, or pass --allow-cpu "
+            "only for tiny debugging runs."
+        )
     model.cfg.use_attn_result = True
+    print(f"  device={model_device}")
     print(f"  {model.cfg.n_layers} layers x {model.cfg.n_heads} heads, d_model={model.cfg.d_model}")
 
     layer3_by_id, layer3_by_key = load_layer3_by_key(args.layer3)
@@ -424,15 +524,24 @@ def main() -> None:
     if not prepared:
         raise SystemExit("[ERROR] No F3-ready instances after Layer3/token filtering.")
 
-    classify_b1_behavior(
-        model,
-        prepared,
-        template=args.template,
-        out_dir=out_dir,
-        rouge_threshold=args.rouge_threshold,
-        rouge_margin=args.rouge_margin,
-        skip_generation=args.no_b1_behavior,
-    )
+    if args.layer4:
+        layer4_by_id, layer4_by_key = load_layer4(args.layer4)
+        apply_layer4_behavior(
+            prepared,
+            layer4_by_id=layer4_by_id,
+            layer4_by_key=layer4_by_key,
+            out_dir=out_dir,
+        )
+    else:
+        classify_b1_behavior(
+            model,
+            prepared,
+            template=args.template,
+            out_dir=out_dir,
+            rouge_threshold=args.rouge_threshold,
+            rouge_margin=args.rouge_margin,
+            skip_generation=args.no_b1_behavior,
+        )
 
     failure, success, control, ambiguous = split_sets(prepared)
     if args.no_b1_behavior:
@@ -452,6 +561,8 @@ def main() -> None:
     manifest = {
         "model": args.model,
         "template": args.template,
+        "layer4": args.layer4,
+        "b1_behavior_source": "layer4" if args.layer4 else "generated",
         "n_b1_loaded": len(b1_instances),
         "n_prepared": len(prepared),
         "n_failure": len(failure),
