@@ -17,6 +17,7 @@ mkdir -p logs results
 
 DATA_JSONL="${DATA_JSONL:-data/processed/wikidata_layer2_1000.jsonl}"
 LAYER3_JSONL="${LAYER3_JSONL:-data/processed/wikidata_layer3_phi3_1000.jsonl}"
+LAYER4_JSONL="${LAYER4_JSONL:-data/processed/wikidata_layer4_phi3_1000.jsonl}"
 MODEL="${MODEL:-microsoft/phi-3-mini-4k-instruct}"
 MODEL_TAG="${MODEL_TAG:-phi3}"
 TEMPLATE="${TEMPLATE:-phi3}"
@@ -41,11 +42,17 @@ conda activate "${CONDA_ENV_NAME}"
 
 [ -f "${LAYER3_JSONL}" ] || {
   echo "[ERROR] Missing Layer-3 parametric answer file: ${LAYER3_JSONL}" >&2
-  echo "Build it first, for example: LAYERS=B5 sbatch build_wikidata_layer3_1000.sh" >&2
+  echo "Build it first, for example: LAYERS=B1 sbatch build_wikidata_layer3_1000.sh" >&2
   exit 1
 }
 
 ARGS=()
+if [ -f "${LAYER4_JSONL}" ]; then
+  ARGS+=(--layer4 "${LAYER4_JSONL}")
+else
+  echo "[WARNING] Layer-4 file not found: ${LAYER4_JSONL}" >&2
+  echo "[WARNING] F3 will generate B1 behavior live unless --no-b1-behavior is used." >&2
+fi
 if [ -n "${MAX_INSTANCES:-}" ]; then
   ARGS+=(--max-instances "${MAX_INSTANCES}")
 fi
@@ -74,6 +81,9 @@ fi
 if [ "${NO_B1_BEHAVIOR:-0}" = "1" ]; then
   ARGS+=(--no-b1-behavior)
 fi
+if [ "${ALLOW_CPU:-0}" = "1" ]; then
+  ARGS+=(--allow-cpu)
+fi
 if [ "${RUN_F3E:-0}" = "1" ]; then
   ARGS+=(--run-f3e)
 fi
@@ -87,6 +97,7 @@ echo "TEMPLATE=${TEMPLATE}"
 echo "DTYPE=${DTYPE}"
 echo "DATA_JSONL=${DATA_JSONL}"
 echo "LAYER3_JSONL=${LAYER3_JSONL}"
+echo "LAYER4_JSONL=${LAYER4_JSONL}"
 echo "OUT_DIR=${OUT_DIR}"
 
 python scripts/run_f3_diagnostic.py \

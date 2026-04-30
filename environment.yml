@@ -13,7 +13,8 @@ dependencies:
       - mwparserfromhell>=0.6.6
 
       # Core ML
-      - torch>=2.1.0
+      - --extra-index-url=https://download.pytorch.org/whl/cu128
+      - torch==2.11.0+cu128
       - transformers>=4.51,<5.0
       - accelerate>=0.26.0
       - huggingface-hub>=0.20.0
