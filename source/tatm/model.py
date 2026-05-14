@@ -10,6 +10,10 @@ from transformer_lens import HookedTransformer
 
 YEAR_PAT = re.compile(r"\b(19|20)\d{2}\b")
 
+# Lexical placeholder inserted by `fact_timeline.eval_builder._strip_years`.
+# Must stay in lock-step with that constant — see methodology Step 2(c).
+YEAR_PLACEHOLDER = "<YEAR>"
+
 
 # ── Phi-3 compatibility patch ────────────────────────────────────────────────
 
@@ -319,6 +323,44 @@ def find_year_positions(
                 year_val = int(combined)
                 if target_year is None or year_val == target_year:
                     positions.update(window_set)
+
+    return sorted(positions)
+
+
+def find_year_placeholder_positions(
+    token_ids: torch.Tensor,
+    tokenizer,
+    *,
+    placeholder: str = YEAR_PLACEHOLDER,
+    max_window: int = 6,
+) -> list[int]:
+    """Find BPE-token positions occupied by the ``<YEAR>`` placeholder.
+
+    Used for F1-b's B3 / B6 attention measurement: the placeholder inserted
+    by ``fact_timeline.eval_builder._strip_years`` is position-preserving,
+    so its BPE span is the same residual-stream slot the year occupied in
+    B1 / B5.  Per methodology Step 2(c)/(d), Phi-3-mini's tokenizer splits
+    ``"<YEAR>"`` into 3 ordinary sub-words (``<``, ``YEAR``, ``>``); other
+    families may use different decompositions, so we use a sliding window
+    over 1–``max_window`` consecutive tokens.
+
+    Returns the union of all positions whose decoded sub-string contains
+    the placeholder (deduplicated, sorted).
+    """
+    ids = token_ids.tolist() if isinstance(token_ids, torch.Tensor) else token_ids
+    positions: set[int] = set()
+    target = placeholder.strip()
+    if not target:
+        return []
+
+    for window in range(1, max_window + 1):
+        for i in range(len(ids) - window + 1):
+            window_set = set(range(i, i + window))
+            if window_set <= positions:
+                continue
+            combined = tokenizer.decode(ids[i : i + window])
+            if target in combined:
+                positions.update(window_set)
 
     return sorted(positions)
 

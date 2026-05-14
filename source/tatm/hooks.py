@@ -27,6 +27,7 @@ def extract_attention_to_positions(
     src_positions: list[int],
     *,
     dest_position: int = -1,
+    agg: str = "mean",
 ) -> torch.Tensor:
     """Extract attention weights from *src_positions* to *dest_position*.
 
@@ -41,19 +42,27 @@ def extract_attention_to_positions(
     tokens : [1, seq_len] token IDs
     src_positions : token indices to measure attention FROM
     dest_position : token index that attends (default: last token)
+    agg : "mean" (default) or "max" — aggregation over src_positions.
+        Methodology F1-a Step 5 (and F1-b "averaged over the placeholder's
+        BPE span") specify mean — the per-instance H_T scalar is
+        $\\bar{A}^{H_T}_i = \\tfrac{1}{|H_T|}\\sum_{(l,h)} \\tfrac{1}{|C_i|}
+        \\sum_{c \\in C_i} A^{l,h}_{c \\to T}$.  "max" is retained for
+        compatibility with the original SAT Probe paper (Yuksekgonul 2024).
 
     Returns
     -------
     Tensor of shape [n_layers, n_heads].
-    For each (layer, head), the value is the **max** attention weight
-    across all src_positions (following the SAT Probe convention of
-    taking max over constraint tokens).
+    For each (layer, head), the value is the **mean** (or max) attention
+    weight across all src_positions.
     """
     n_layers = model.cfg.n_layers
     n_heads  = model.cfg.n_heads
 
     if not src_positions:
         return torch.zeros(n_layers, n_heads)
+
+    if agg not in ("mean", "max"):
+        raise ValueError(f"agg must be 'mean' or 'max', got {agg!r}")
 
     seq_len  = tokens.shape[-1]
     dest_idx = dest_position if dest_position >= 0 else seq_len + dest_position
@@ -65,7 +74,10 @@ def extract_attention_to_positions(
         def _hook(pattern: torch.Tensor, hook) -> torch.Tensor:
             # pattern: [batch, n_heads, seq_q, seq_k]
             attn = pattern[0, :, dest_idx, src_positions]   # [H, n_srcs]
-            result[layer] = attn.max(dim=-1).values.float().cpu()
+            if agg == "mean":
+                result[layer] = attn.mean(dim=-1).float().cpu()
+            else:
+                result[layer] = attn.max(dim=-1).values.float().cpu()
             return pattern   # return unchanged so forward pass continues
         return _hook
 

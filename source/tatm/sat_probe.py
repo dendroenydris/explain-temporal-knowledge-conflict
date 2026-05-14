@@ -140,6 +140,13 @@ def collect_features(
         meta.append({
             "idx": idx,
             "instance_id": inst.get("instance_id", f"inst_{idx}"),
+            # Fact-level keys needed for F2's F1-cross-reference: F1 is
+            # typically run on B5 instances and F2 on B1, so the
+            # instance_id namespaces differ and we have to match on the
+            # underlying ``(fact_id, t_old, t_new)`` tuple instead.
+            "fact_id": inst.get("fact_id", ""),
+            "t_old": inst.get("t_old"),
+            "t_new": inst.get("t_new"),
             "generated": generated,
             "answer_new": answer_new,
             "answer_old": inst.get("answer_old", ""),
@@ -166,7 +173,7 @@ def train_probe(
     X: np.ndarray,
     y: np.ndarray,
     *,
-    C: float = 10.0,
+    C: float = 0.05,
     n_folds: int = 5,
 ) -> ProbeResult:
     """Train L1-regularised logistic regression with stratified CV.
@@ -176,14 +183,18 @@ def train_probe(
     X : [N, L*H]
     y : [N] binary labels
     C : inverse regularisation strength.
-        With standardized features and n samples (n_pos pos / n_neg neg),
-        the maximum gradient at w=0 is bounded by ~0.45 regardless of
-        feature values (derived from the 27/11 split in our dataset).
-        For any coefficient to survive L1, we need 1/C < 0.45, i.e. C > 2.2.
-        C=10.0 gives 1/C=0.1, well below the threshold, so genuine signal
-        can emerge while L1 still kills pure noise features.
-        (The SAT Probe paper used C=0.05 on datasets with >500 instances
-        where gradients are proportionally larger.)
+
+        The methodology specifies ``C = 0.05`` (matching Yuksekgonul et al.
+        2024's SAT Probe, F1-a Step 3), which is the default here.  This is
+        appropriate for the planned ``≥ 500``-instance DYNAMICQA-style
+        corpus where per-feature gradients are proportionally large.
+
+        For smaller pilot datasets (e.g. the ~38-instance Phi-3 pilot the
+        F1-a Step 3 gradient at w=0 is bounded by ~0.45, so ``1/C`` must
+        be ``< 0.45`` for any coefficient to survive L1 (i.e. ``C > 2.2``).
+        Pass ``C=10.0`` on those splits — the all-zero coefficient
+        diagnostic below will warn when ``C`` is too aggressive for the
+        current sample size.
     n_folds : number of CV folds
 
     Returns
@@ -285,3 +296,115 @@ def analyse_weights(
     entries.sort(key=lambda x: abs(x[2]), reverse=True)
     result.top_heads = entries[:top_k]
     return entries[:top_k]
+
+
+def fallback_temporal_heads(
+    top_heads: list[tuple[int, int, float]],
+    *,
+    top_k: int = 3,
+) -> list[tuple[int, int]]:
+    """Return the top-``top_k`` (layer, head) pairs by ``|coef|``.
+
+    Used under the **temporal-head fallback** (methodology F1-a Step 5,
+    final sentence): when the DYNAMICQA temporal-head validation does not
+    return a $\\mathcal{H}_T$, the per-instance F1 scalar instead uses the
+    top-3 attention heads by probe-coefficient magnitude.
+    """
+    return [(l, h) for l, h, _ in top_heads[:top_k]]
+
+
+# ── F1-positive per-instance detector (methodology F1-a Step 5) ──────────────
+
+@dataclass
+class F1PositiveResult:
+    """Per-instance F1 verdict from the H_T-attention scalar.
+
+    Methodology F1-a Step 5:
+      $\\bar{A}^{H_T}_i = \\tfrac{1}{|H_T|} \\sum_{(l,h) \\in H_T}
+        \\tfrac{1}{|C_i|} \\sum_{c \\in C_i} A^{l,h}_{c \\to T}$
+    Instance ``i`` is **F1-positive** iff $\\bar{A}^{H_T}_i$ lies below the
+    25th-percentile of the B1-success scalar distribution.  We additionally
+    report the sweep over ``{20, 25, 33}``-th percentiles (Step 5).
+    """
+    ht_heads: list[tuple[int, int]]
+    is_fallback: bool
+    primary_percentile: int                  # which percentile produced the primary verdict
+    threshold_by_percentile: dict[int, float]
+    scalar_per_instance: list[float]         # length N
+    f1_positive_by_percentile: dict[int, list[bool]]
+
+
+def compute_f1_positive_instances(
+    X: np.ndarray,
+    y: np.ndarray,
+    ht_heads: list[tuple[int, int]],
+    *,
+    n_heads: int,
+    percentiles: tuple[int, ...] = (20, 25, 33),
+    primary_percentile: int = 25,
+    is_fallback: bool = False,
+) -> F1PositiveResult:
+    """Compute the per-instance H_T-attention scalar and F1-positive verdicts.
+
+    ``X[i, l*n_heads + h]`` must already encode the mean (over constraint
+    tokens ``C_i``) attention from year tokens to the prediction position
+    at head ``(l, h)`` — i.e., the features produced by
+    :func:`collect_features` with the methodology-default ``agg="mean"``.
+
+    Parameters
+    ----------
+    X : [N, L*H]  attention features per instance (mean-over-C_i)
+    y : [N]       1 if B1 success, 0 if B1 failure
+    ht_heads : list of (layer, head) pairs forming H_T (or top-3 fallback)
+    n_heads : number of heads per layer (needed to flatten (l, h) → index)
+    percentiles : sweep of percentile thresholds, applied to the B1-success
+        scalar distribution.  The methodology requires {20, 25, 33}.
+    primary_percentile : which entry of *percentiles* the primary verdict uses
+    is_fallback : True if ``ht_heads`` was produced by the top-3 fallback
+        rather than the DYNAMICQA temporal-head validation (Step 5 says
+        the fallback must itself be flagged).
+
+    Returns
+    -------
+    :class:`F1PositiveResult`.  An instance is F1-positive at percentile
+    ``p`` iff its scalar is **strictly below** the ``p``-th percentile of
+    the B1-success distribution.
+    """
+    if primary_percentile not in percentiles:
+        raise ValueError(
+            f"primary_percentile={primary_percentile} not in percentiles={percentiles}"
+        )
+    if not ht_heads:
+        empty = [False] * len(y)
+        return F1PositiveResult(
+            ht_heads=[], is_fallback=is_fallback,
+            primary_percentile=primary_percentile,
+            threshold_by_percentile={p: float("nan") for p in percentiles},
+            scalar_per_instance=[float("nan")] * len(y),
+            f1_positive_by_percentile={p: empty for p in percentiles},
+        )
+
+    flat_idx = np.array([l * n_heads + h for (l, h) in ht_heads], dtype=int)
+    scalars = X[:, flat_idx].mean(axis=1)            # mean over H_T heads
+
+    succ_scalars = scalars[y == 1]
+    if succ_scalars.size == 0:
+        # Fall back to the full distribution if no success instances are
+        # available (e.g. probe ran on an all-failure pilot split).
+        succ_scalars = scalars
+
+    thresholds: dict[int, float] = {
+        p: float(np.percentile(succ_scalars, p)) for p in percentiles
+    }
+    f1_pos: dict[int, list[bool]] = {
+        p: [bool(s < thresholds[p]) for s in scalars] for p in percentiles
+    }
+
+    return F1PositiveResult(
+        ht_heads=list(ht_heads),
+        is_fallback=is_fallback,
+        primary_percentile=primary_percentile,
+        threshold_by_percentile=thresholds,
+        scalar_per_instance=scalars.astype(float).tolist(),
+        f1_positive_by_percentile=f1_pos,
+    )

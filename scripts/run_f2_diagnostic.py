@@ -58,8 +58,15 @@ _root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_root / "source"))
 
 from tatm.f2_diagnosis import (
+    F2_DEFAULT_P_FINAL_HIGH,
+    F2_DEFAULT_PEAK_LOW_THR,
+    F2_DEFAULT_RS_F3_THR,
+    F2_DEFAULT_RS_STRONG_THR,
+    assign_f2_verdicts,
     behavioral_cross_analysis,
     compute_route_scores,
+    load_f1_consistency,
+    load_f1_positive_map,
     run_str_patching,
 )
 from tatm.model import (
@@ -363,21 +370,39 @@ def run_f2a(
         print("  No instances passed the behavioral filter.")
         return []
 
-    recoveries = [r.recovery_fraction for r in results]
+    recoveries   = [r.recovery_fraction for r in results]
+    p_recoveries = [r.p_new_recovery_fraction for r in results]
+    n_shifted    = sum(1 for r in results if r.top1_shifted_to_new)
+    n_flipped    = sum(1 for r in results if r.top1_flipped_from_corrupted)
+
     mean_rec   = float(np.mean(recoveries))
     med_rec    = float(np.median(recoveries))
     pct_50     = sum(1 for r in recoveries if r >= 0.5) / len(recoveries)
+    mean_p_rec = float(np.mean(p_recoveries))
+    med_p_rec  = float(np.median(p_recoveries))
 
     print(f"\n  Instances with valid patching trials: {len(results)}")
-    print(f"  Mean  recovery fraction: {mean_rec:+.3f}")
-    print(f"  Median recovery fraction: {med_rec:+.3f}")
-    print(f"  Fraction ≥ 50% recovery (causal): {pct_50:.1%}")
+    print(f"  Mean  logit-diff recovery fraction: {mean_rec:+.3f}")
+    print(f"  Median logit-diff recovery fraction: {med_rec:+.3f}")
+    print(f"  Fraction ≥ 50% recovery (causal):    {pct_50:.1%}")
+    print(f"  Mean  P(answer_new) recovery:        {mean_p_rec:+.3f}   "
+          "(methodology line 311 'Does p(answer_new) recover?')")
+    print(f"  Median P(answer_new) recovery:       {med_p_rec:+.3f}")
+    print(f"  Top-1 shifted → answer_new:          {n_shifted}/{len(results)}  "
+          f"({100*n_shifted/len(results):.1f}%)  (methodology line 307 'top-1 shift')")
+    print(f"  Top-1 flipped away from corrupted:   {n_flipped}/{len(results)}  "
+          f"({100*n_flipped/len(results):.1f}%)")
 
     output = {
         "n_patched": len(results),
         "mean_recovery": mean_rec,
         "median_recovery": med_rec,
         "pct_ge_50_recovery": pct_50,
+        "mean_p_new_recovery": mean_p_rec,
+        "median_p_new_recovery": med_p_rec,
+        "n_top1_shifted_to_new": n_shifted,
+        "n_top1_flipped_from_corrupted": n_flipped,
+        "rate_top1_shifted_to_new": n_shifted / len(results),
         "per_instance": [
             {
                 "instance_id": r.instance_id,
@@ -385,9 +410,15 @@ def run_f2a(
                 "logit_diff_corrupted": r.logit_diff_corrupted,
                 "logit_diff_patched": r.logit_diff_patched,
                 "recovery_fraction": r.recovery_fraction,
-                "top1_clean": r.top1_clean,
+                "p_new_clean":     r.p_new_clean,
+                "p_new_corrupted": r.p_new_corrupted,
+                "p_new_patched":   r.p_new_patched,
+                "p_new_recovery_fraction": r.p_new_recovery_fraction,
+                "top1_clean":     r.top1_clean,
                 "top1_corrupted": r.top1_corrupted,
-                "top1_patched": r.top1_patched,
+                "top1_patched":   r.top1_patched,
+                "top1_shifted_to_new":         r.top1_shifted_to_new,
+                "top1_flipped_from_corrupted": r.top1_flipped_from_corrupted,
             }
             for r in results
         ],
@@ -406,7 +437,21 @@ def run_f2b(
     temporal_heads: list[tuple[int, int]],
     template: str,
     out_dir: Path,
-) -> None:
+    *,
+    population_label: str = "reverts_old",
+    l_t_mode: str = "median",
+    lens_kind: str = "raw",
+    p_final_high: float = F2_DEFAULT_P_FINAL_HIGH,
+    rs_strong_thr: float = F2_DEFAULT_RS_STRONG_THR,
+    rs_f3_thr: float = F2_DEFAULT_RS_F3_THR,
+    peak_low_thr: float = F2_DEFAULT_PEAK_LOW_THR,
+    cached_trajectories: dict | None = None,
+) -> list:
+    """Run F2-b RouteScore + per-instance regime classification.
+
+    Returns the list of ``RouteScoreResult`` so the main driver can feed
+    them into the F1-cross-referenced verdict assembly.
+    """
     print("\n" + "=" * 60)
     print("F2-b: RouteScore  (Temporal Signal Attenuation)")
     print("=" * 60)
@@ -414,18 +459,37 @@ def run_f2b(
     temporal_layers = sorted({l for l, _ in temporal_heads})
     if not temporal_layers:
         print("  No temporal head layers — skipping RouteScore.")
-        return
+        return []
 
-    print(f"  Temporal head layers: {temporal_layers}")
-    print(f"  L_T = {max(temporal_layers)}  (layer where P^L_T is measured)\n")
+    print(f"  Population                  : {population_label}")
+    print(f"  Temporal head layers        : {temporal_layers}")
+    print(f"  L_T mode                    : {l_t_mode}  (methodology primary: median)")
+    print(f"  Lens kind                   : {lens_kind}  (methodology primary: tuned)")
+    print(f"  Regime thresholds           : "
+          f"P^L≥{p_final_high}→not_f2, "
+          f"peak_drop≥{rs_f3_thr:.2f}→F3, "
+          f"peak_drop∈[{rs_strong_thr:.2f},{rs_f3_thr:.2f})→F2-weak\n"
+          f"  Absolute peak gate          : "
+          f"|P^l_peak|<{peak_low_thr:.2f} ⇒ F2-strong ('never rises')\n")
 
-    results = compute_route_scores(
-        model, reverts_old, temporal_layers, template=template, verbose=True,
+    results, l_t = compute_route_scores(
+        model, reverts_old, temporal_layers,
+        template=template,
+        l_t_mode=l_t_mode,
+        lens_kind=lens_kind,
+        p_final_high=p_final_high,
+        rs_strong_thr=rs_strong_thr,
+        rs_f3_thr=rs_f3_thr,
+        peak_low_thr=peak_low_thr,
+        cached_trajectories=cached_trajectories,
+        verbose=True,
     )
 
     if not results:
         print("  No RouteScore results (check answer token lookup).")
-        return
+        return []
+
+    print(f"  Resolved L_T                : {l_t}")
 
     route_scores      = [r.route_score for r in results]
     route_scores_peak = [r.route_score_peak for r in results]
@@ -433,6 +497,15 @@ def run_f2b(
     p_at_peak         = [r.p_new_peak for r in results]
     p_at_final        = [r.p_new_at_final for r in results]
     peak_layers       = [r.peak_layer for r in results]
+    regimes           = [r.f2_regime for r in results]
+
+    regime_counts = {
+        "not_f2":    regimes.count("not_f2"),
+        "f2_strong": regimes.count("f2_strong"),
+        "f2_weak":   regimes.count("f2_weak"),
+        "f3":        regimes.count("f3"),
+    }
+    n_f2_pooled = regime_counts["f2_strong"] + regime_counts["f2_weak"]
 
     print(f"\n  n = {len(results)}")
     print(f"  Mean  P(answer_new) at L_T:    {np.mean(p_at_lt):.4f}")
@@ -440,14 +513,29 @@ def run_f2b(
           f"(avg peak layer: {np.mean(peak_layers):.1f})")
     print(f"  Mean  P(answer_new) at L_final:{np.mean(p_at_final):.4f}")
     print(f"  Mean  RouteScore (L_T basis):  {np.mean(route_scores):+.4f}")
-    print(f"  Mean  RouteScore (peak basis):  {np.mean(route_scores_peak):+.4f}")
-    print(f"  Fraction peak RouteScore > 0.05 (F2 signal): "
-          f"{sum(1 for s in route_scores_peak if s > 0.05)/len(route_scores_peak):.1%}")
+    print(f"  Mean  RouteScore (peak basis): {np.mean(route_scores_peak):+.4f}")
+    print(f"\n  F2 regime distribution (per-instance):")
+    for label, count in regime_counts.items():
+        print(f"    {label:>10s}: {count:>4d} ({100*count/len(results):5.1f}%)")
+    print(f"    {'F2 pooled':>10s}: {n_f2_pooled:>4d} "
+          f"({100*n_f2_pooled/len(results):5.1f}%)  "
+          "(F2-strong + F2-weak, methodology line 294)")
 
     output = {
-        "l_t": max(temporal_layers),
+        "l_t": l_t,
+        "l_t_mode": l_t_mode,
+        "lens_kind": lens_kind,
+        "population": population_label,
         "temporal_layers": temporal_layers,
+        "regime_thresholds": {
+            "p_final_high":  p_final_high,
+            "rs_strong_thr": rs_strong_thr,
+            "rs_f3_thr":     rs_f3_thr,
+            "peak_low_thr":  peak_low_thr,
+        },
         "n": len(results),
+        "regime_counts": regime_counts,
+        "regime_pooled_f2": n_f2_pooled,
         "mean_p_new_at_lt": float(np.mean(p_at_lt)),
         "mean_p_new_peak": float(np.mean(p_at_peak)),
         "mean_peak_layer": float(np.mean(peak_layers)),
@@ -469,6 +557,7 @@ def run_f2b(
                 "p_new_at_final": r.p_new_at_final,
                 "route_score": r.route_score,
                 "route_score_peak": r.route_score_peak,
+                "f2_regime": r.f2_regime,
                 # Full trajectory arrays (useful for plotting)
                 "probs_new": r.trajectory.probs_new.tolist(),
                 "probs_old": r.trajectory.probs_old.tolist(),
@@ -478,6 +567,8 @@ def run_f2b(
     }
     with open(out_dir / "f2b_route_score.json", "w") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
+
+    return results
 
 
 # ── F2-c: B5 vs B6 Behavioral Cross-Analysis ─────────────────────────────────
@@ -490,7 +581,13 @@ def run_f2c(
     template: str,
     out_dir: Path,
     b1_success_map: dict[str, bool] | None = None,
-) -> None:
+):
+    """Run F2-c B5×B6 (primary) + B1×B5 (supplementary) per methodology lines 334–349.
+
+    Returns the populated :class:`BehavioralCrossResult` so the main
+    driver can feed the per-instance details into the final F2-verdict
+    assembly.
+    """
     print("\n" + "=" * 60)
     print("F2-c: B5 vs B6 Behavioral Cross-Analysis")
     print("=" * 60)
@@ -504,14 +601,40 @@ def run_f2c(
         template=template, verbose=True,
     )
 
-    print(f"\n  n = {result.n_total}")
+    n = result.n_total
+
+    print(f"\n  n = {n}")
     print(f"  B1 accuracy : {result.b1_accuracy:.1%}")
     print(f"  B5 accuracy : {result.b5_accuracy:.1%}")
     print(f"  B6 accuracy : {result.b6_accuracy:.1%}")
-    print(f"\n  B1-fail ∩ B5-success : {result.n_b1_fail_b5_success}  "
-          f"(persuasion too weak, not F2)")
-    print(f"  B1-fail ∩ B5-fail    : {result.n_b1_fail_b5_fail}  "
-          f"(strong F2 signal — {result.n_b1_fail_b5_fail_rate:.1%} of B1-failures)")
+    print(f"  ΔB5−B6      : {(result.b5_accuracy - result.b6_accuracy):+.1%}  "
+          "(positive ⇒ year token is a critical routing signal)")
+
+    print("\n  ── PRIMARY F2 detector: per-instance B5 × B6 ───────────────────")
+    print(f"    B5-success ∩ B6-fail    : {result.n_b5_success_b6_fail:>4d} "
+          "  (year-dependent routing works; ANTI-F2 evidence)")
+    print(f"    B5-fail    ∩ B6-fail    : {result.n_b5_fail_b6_fail:>4d} "
+          "  (CANDIDATE F2 — year-based routing broken)")
+    print(f"    B5-fail    ∩ B6-success : {result.n_b5_fail_b6_success:>4d} "
+          "  (PARADOXICAL — year tokens hurt performance)")
+    print(f"    B5-success ∩ B6-success : {result.n_b5_success_b6_success:>4d} "
+          "  (year not necessary)")
+
+    print("\n  ── SUPPLEMENTARY: B1 × B5 cross-reference ──────────────────────")
+    print(f"    B1-fail    ∩ B5-success : {result.n_b1_fail_b5_success:>4d} "
+          "  (single-passage persuasion too weak; rules out F2)")
+    print(f"    B1-fail    ∩ B5-fail    : {result.n_b1_fail_b5_fail:>4d} "
+          f"  (ambiguous; {result.n_b1_fail_b5_fail_rate:.1%} of B1-failures)")
+
+    print("\n  ── 3-WAY DISAMBIGUATION: B1 × B5 × B6 (methodology line 347) ─")
+    print(f"    B1-fail ∩ B5-fail    ∩ B6-fail    : "
+          f"{result.n_b1f_b5f_b6f:>4d}   (PARAMETRIC DOMINANCE — likely not F2)")
+    print(f"    B1-fail ∩ B5-fail    ∩ B6-success : "
+          f"{result.n_b1f_b5f_b6s:>4d}   (year NOT required; year hurts)")
+    print(f"    B1-fail ∩ B5-success ∩ B6-fail    : "
+          f"{result.n_b1f_b5s_b6f:>4d}   (YEAR-DRIVEN RESCUE — rules out F2)")
+    print(f"    B1-fail ∩ B5-success ∩ B6-success : "
+          f"{result.n_b1f_b5s_b6s:>4d}   (dual-evidence rescue regardless of year)")
 
     if result.b5_accuracy > result.b6_accuracy + 0.05:
         print("\n  → B5 >> B6: year in evidence is a critical routing signal.")
@@ -519,17 +642,46 @@ def run_f2c(
         print("\n  → B5 ≈ B6: model does NOT use year token in evidence to route.")
 
     output = {
-        "n_total": result.n_total,
+        "n_total": n,
         "b1_accuracy": result.b1_accuracy,
         "b5_accuracy": result.b5_accuracy,
         "b6_accuracy": result.b6_accuracy,
+        # Primary (B5 × B6) — methodology lines 340–344
+        "b5xb6_primary": {
+            "n_b5_success_b6_fail":     result.n_b5_success_b6_fail,
+            "n_b5_fail_b6_fail":        result.n_b5_fail_b6_fail,
+            "n_b5_fail_b6_success":     result.n_b5_fail_b6_success,
+            "n_b5_success_b6_success":  result.n_b5_success_b6_success,
+            "rate_b5_fail_b6_fail":     result.n_b5_fail_b6_fail / n if n else 0.0,
+            "rate_b5_success_b6_fail":  result.n_b5_success_b6_fail / n if n else 0.0,
+        },
+        # Supplementary (B1 × B5) — methodology lines 345–349
+        "b1xb5_supplementary": {
+            "n_b1_fail_b5_success":   result.n_b1_fail_b5_success,
+            "n_b1_fail_b5_fail":      result.n_b1_fail_b5_fail,
+            "n_b1_fail_b5_fail_rate": result.n_b1_fail_b5_fail_rate,
+        },
+        # 3-way disambiguation cells (methodology line 347)
+        "b1xb5xb6_disambiguation": {
+            "n_b1f_b5f_b6f":  result.n_b1f_b5f_b6f,   # parametric dominance
+            "n_b1f_b5f_b6s":  result.n_b1f_b5f_b6s,   # year not required
+            "n_b1f_b5s_b6f":  result.n_b1f_b5s_b6f,   # year-driven rescue
+            "n_b1f_b5s_b6s":  result.n_b1f_b5s_b6s,   # robust dual-evidence rescue
+            "rate_parametric_dominance_in_b1f_b5f": (
+                result.n_b1f_b5f_b6f / result.n_b1_fail_b5_fail
+                if result.n_b1_fail_b5_fail else 0.0
+            ),
+        },
+        # Back-compat aliases (used by plot_f2_results.py and earlier readers)
         "n_b1_fail_b5_success": result.n_b1_fail_b5_success,
-        "n_b1_fail_b5_fail": result.n_b1_fail_b5_fail,
+        "n_b1_fail_b5_fail":    result.n_b1_fail_b5_fail,
         "n_b1_fail_b5_fail_rate": result.n_b1_fail_b5_fail_rate,
         "details": result.details,
     }
     with open(out_dir / "f2c_b5_vs_b6.json", "w") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
+
+    return result
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -574,7 +726,106 @@ def main():
     )
     parser.add_argument(
         "--no-reverts-filter", action="store_true",
-        help="Skip REVERTS_OLD filter; run F2-b on all B1 instances",
+        help=(
+            "[deprecated, kept for back-compat] Equivalent to "
+            "``--f2b-population all_b1``: skip REVERTS_OLD filter and run "
+            "F2-b on all B1 instances."
+        ),
+    )
+    parser.add_argument(
+        "--f2b-population",
+        default="reverts_old",
+        choices=["reverts_old", "b1_failure", "all_b1"],
+        help=(
+            "Which population to run F2-b on. "
+            "``reverts_old`` (default): B1-failure ∩ output=answer_old — "
+            "the strictest behavioral proxy for methodology Part-II's "
+            "PARAM_OLD panel.  "
+            "``b1_failure``: all B1-failure instances (output ≠ answer_new) "
+            "— the methodology-direct setting per line 332.  "
+            "``all_b1``: every B1 instance (legacy; ``--no-reverts-filter`` "
+            "alias)."
+        ),
+    )
+    parser.add_argument(
+        "--lens-kind", default="raw", choices=["raw", "tuned"],
+        help=(
+            "Logit-Lens flavour for F2-b's trajectory.  Methodology F3-a "
+            "Step 3 specifies ``tuned`` as primary; ``tuned`` is not yet "
+            "implemented and currently falls back to ``raw`` with a "
+            "one-time warning."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-cache",
+        help=(
+            "Optional path to a previously saved ``f2b_route_score.json`` "
+            "(or a compatible trajectory cache).  When provided, F2-b "
+            "reuses ``probs_new`` / ``probs_old`` arrays per ``instance_id`` "
+            "instead of re-running the lens forward pass — implements the "
+            "methodology line 325 'trajectories already cached in F3-a' "
+            "directive."
+        ),
+    )
+    parser.add_argument(
+        "--f1-results",
+        help=(
+            "Optional path to F1-a output JSON (typically "
+            "results/f1_diagnostic/f1a_sat_probe.json).  When provided, "
+            "every F2 verdict is cross-referenced against F1-a Step 5's "
+            "per-instance F1-positive verdict (methodology line 284): "
+            "F1-positive ⇒ year not read ⇒ classified F1, not F2."
+        ),
+    )
+    parser.add_argument(
+        "--f1-percentile", type=int, default=25, choices=[20, 25, 33],
+        help=(
+            "Which F1-a Step 5 percentile to use for the F1 cross-"
+            "reference (methodology default: 25)."
+        ),
+    )
+    parser.add_argument(
+        "--f1b-results",
+        help=(
+            "Optional path to F1-b output JSON (typically "
+            "results/f1_diagnostic/f1b_attention_comparison.json).  When "
+            "provided, the population-level Mann-Whitney p-value is read "
+            "and every F2 verdict is suffixed with ``_f1b_nonsignif`` if "
+            "F1-b fails to confirm the 'Time Set' population premise "
+            "(methodology line 284)."
+        ),
+    )
+    parser.add_argument(
+        "--f1b-alpha", type=float, default=0.05,
+        help="Significance threshold for F1-b's Mann-Whitney p (default 0.05).",
+    )
+    parser.add_argument(
+        "--l-t-mode", default="median", choices=["median", "max", "min"],
+        help=(
+            "How to collapse multi-layer H_T into L_T for F2-b's "
+            "RouteScore (methodology primary: median = $\\ell_{H_T}$)."
+        ),
+    )
+    parser.add_argument(
+        "--p-final-high", type=float, default=F2_DEFAULT_P_FINAL_HIGH,
+        help="Final-P^L threshold above which the signal is considered to have survived (not_f2).",
+    )
+    parser.add_argument(
+        "--rs-strong-thr", type=float, default=F2_DEFAULT_RS_STRONG_THR,
+        help="Minimum peak RouteScore for a 'mid-rise to have occurred' (else F2-strong).",
+    )
+    parser.add_argument(
+        "--rs-f3-thr", type=float, default=F2_DEFAULT_RS_F3_THR,
+        help="Peak RouteScore above which the trajectory is classified as F3 candidate.",
+    )
+    parser.add_argument(
+        "--peak-low-thr", type=float, default=F2_DEFAULT_PEAK_LOW_THR,
+        help=(
+            "Absolute P^l_peak threshold below which the trajectory is "
+            "treated as 'never rises' → F2-strong (methodology line 290, "
+            "gates the F2-strong classification on the *peak value* in "
+            "addition to the peak-minus-final delta)."
+        ),
     )
     args = parser.parse_args()
 
@@ -656,31 +907,201 @@ def main():
     print(f"  {model.cfg.n_layers} layers × {model.cfg.n_heads} heads  "
           f"d_model={model.cfg.d_model}")
 
-    # ── REVERTS_OLD filter ─────────────────────────────────────────────────
-    b1_success_map: dict[str, bool] | None = None
+    # ── Resolve F2-b population ────────────────────────────────────────────
+    # Back-compat: --no-reverts-filter overrides --f2b-population to all_b1.
     if args.no_reverts_filter:
-        reverts_old = b1_instances
-        print(f"\n[--no-reverts-filter] Using all {len(reverts_old)} B1 instances for F2-b.")
+        f2b_population = "all_b1"
     else:
-        reverts_old, b1_success_map = run_reverts_old_filter(
+        f2b_population = args.f2b_population
+
+    b1_success_map: dict[str, bool] | None = None
+    reverts_old: list[dict]
+
+    if f2b_population == "all_b1":
+        reverts_old = b1_instances
+        print(f"\n[F2-b population] all_b1: using all {len(reverts_old)} B1 instances.")
+    else:
+        # Run the REVERTS_OLD pass first (we need it for both reverts_old and
+        # b1_failure populations, since both filter on B1 generation outcome).
+        reverts_old_only, b1_success_map = run_reverts_old_filter(
             model, b1_instances, args.template, out_dir,
         )
+        if f2b_population == "reverts_old":
+            reverts_old = reverts_old_only
+        else:  # b1_failure
+            # Methodology line 332 says "B1-failure instances" generically.
+            # Take every instance where the model did not output answer_new
+            # on B1.  REVERTS_OTHER is included; REVERTS_OLD is included.
+            reverts_old = [
+                inst for inst in b1_instances
+                if not b1_success_map.get(inst.get("instance_id", ""), False)
+            ]
         if not reverts_old:
-            print("\nNo REVERTS_OLD instances found. Exiting.")
+            print(f"\nNo instances in population '{f2b_population}'. Exiting.")
             return
+        print(f"\n[F2-b population] {f2b_population}: "
+              f"{len(reverts_old)} instances "
+              f"(out of {len(b1_instances)} B1).")
+
+    # ── Optional cross-script trajectory cache (methodology line 325) ──────
+    cached_trajectories = None
+    if args.trajectory_cache:
+        try:
+            from tatm.logit_lens import LogitTrajectory
+            import numpy as _np
+
+            with open(args.trajectory_cache) as fh:
+                cache_data = json.load(fh)
+            cache_rows = cache_data.get("per_instance", [])
+            cached_trajectories = {}
+            for row in cache_rows:
+                iid = row.get("instance_id", "")
+                if not iid or "probs_new" not in row or "probs_old" not in row:
+                    continue
+                cached_trajectories[iid] = LogitTrajectory(
+                    probs_new=_np.asarray(row["probs_new"], dtype=float),
+                    probs_old=_np.asarray(row["probs_old"], dtype=float),
+                    logits_new=_np.zeros(len(row["probs_new"])),
+                    logits_old=_np.zeros(len(row["probs_old"])),
+                )
+            print(f"[trajectory-cache] Loaded {len(cached_trajectories)} "
+                  f"trajectories from {args.trajectory_cache}.")
+        except Exception as exc:
+            print(f"[trajectory-cache] WARNING: could not load "
+                  f"{args.trajectory_cache} ({exc}); F2-b will recompute.")
+            cached_trajectories = None
 
     # ── F2-a ───────────────────────────────────────────────────────────────
     if "f2a" not in args.skip:
         run_f2a(model, b5_instances, temporal_heads, args.template, out_dir)
 
     # ── F2-b ───────────────────────────────────────────────────────────────
+    route_results = []
     if "f2b" not in args.skip:
-        run_f2b(model, reverts_old, temporal_heads, args.template, out_dir)
+        route_results = run_f2b(
+            model, reverts_old, temporal_heads, args.template, out_dir,
+            population_label=f2b_population,
+            l_t_mode=args.l_t_mode,
+            lens_kind=args.lens_kind,
+            p_final_high=args.p_final_high,
+            rs_strong_thr=args.rs_strong_thr,
+            rs_f3_thr=args.rs_f3_thr,
+            peak_low_thr=args.peak_low_thr,
+            cached_trajectories=cached_trajectories,
+        )
 
     # ── F2-c ───────────────────────────────────────────────────────────────
+    f2c_result = None
     if "f2c" not in args.skip:
-        run_f2c(model, b1_instances, b5_instances, b6_instances,
-                args.template, out_dir, b1_success_map=b1_success_map)
+        f2c_result = run_f2c(
+            model, b1_instances, b5_instances, b6_instances,
+            args.template, out_dir, b1_success_map=b1_success_map,
+        )
+
+    # ── F2 verdict assembly (methodology lines 282–294) ────────────────────
+    # Per-instance verdict combining F2-b regime + F1-a Step-5 status.
+    # The F1 cross-reference is *optional* — without it we report each
+    # instance's regime with an ``_unverified`` suffix so downstream
+    # readers know F1 ruling-out has not been applied.
+    if route_results:
+        f1_by_iid: dict[str, bool] = {}
+        f1_by_key: dict[tuple, bool] = {}
+        if args.f1_results:
+            try:
+                f1_by_iid, f1_by_key = load_f1_positive_map(
+                    args.f1_results, percentile=args.f1_percentile,
+                )
+                print(f"\n[F1-a cross-reference] Loaded {len(f1_by_iid)} F1-a Step-5 "
+                      f"verdicts from {args.f1_results} (percentile={args.f1_percentile}).")
+            except Exception as exc:
+                print(f"\n[F1-a cross-reference] WARNING: failed to load "
+                      f"{args.f1_results} — proceeding without F1-a cross-reference. "
+                      f"Reason: {exc}")
+
+        # F1-b population consistency (methodology line 284): if F1-b is
+        # non-significant, every F2 verdict is annotated with ``_f1b_nonsignif``.
+        f1b_consistency: dict | None = None
+        if args.f1b_results:
+            try:
+                f1b_consistency = load_f1_consistency(
+                    args.f1b_results, alpha=args.f1b_alpha,
+                )
+                p = f1b_consistency.get("mann_whitney_p")
+                if p is None:
+                    print(f"\n[F1-b consistency] WARNING: {args.f1b_results} has "
+                          "no Mann-Whitney p; consistency check skipped.")
+                elif f1b_consistency["f1b_significant"]:
+                    print(f"\n[F1-b consistency] OK: Mann-Whitney p={p:.4g} "
+                          f"< α={args.f1b_alpha} — 'Time Set' premise holds.")
+                else:
+                    print(f"\n[F1-b consistency] WARNING: Mann-Whitney p={p:.4g} "
+                          f"≥ α={args.f1b_alpha} — F1-b does NOT confirm the "
+                          "'Time Set' population premise; every F2/F3 verdict "
+                          "below is suffixed ``_f1b_nonsignif``.")
+            except Exception as exc:
+                print(f"\n[F1-b consistency] WARNING: failed to load "
+                      f"{args.f1b_results} ({exc}); consistency check skipped.")
+                f1b_consistency = None
+
+        verdicts = assign_f2_verdicts(
+            reverts_old, route_results,
+            f1_by_iid=f1_by_iid, f1_by_key=f1_by_key,
+            f1b_consistency=f1b_consistency,
+        )
+
+        verdict_counts: dict[str, int] = {}
+        for v in verdicts:
+            verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
+
+        print("\n  ── Final F2 verdict (per-instance, F1-cross-referenced) ─────")
+        # Display order: clean → unverified → f1b_nonsignif suffixes.
+        verdict_label_order = []
+        for base in [
+            "F1", "F2_strong", "F2_weak", "F3_candidate",
+            "not_routing_failure", "undetermined",
+        ]:
+            verdict_label_order.append(base)
+            verdict_label_order.append(f"{base}_unverified")
+            verdict_label_order.append(f"{base}_f1b_nonsignif")
+            verdict_label_order.append(f"{base}_unverified_f1b_nonsignif")
+        # Catch anything else we didn't enumerate
+        for k in sorted(verdict_counts.keys()):
+            if k not in verdict_label_order:
+                verdict_label_order.append(k)
+        for label in verdict_label_order:
+            count = verdict_counts.get(label, 0)
+            if count:
+                print(f"    {label:>36s}: {count:>4d} "
+                      f"({100*count/len(verdicts):5.1f}%)")
+
+        verdict_output = {
+            "n": len(verdicts),
+            "f1_results_path":  args.f1_results,
+            "f1_percentile":    args.f1_percentile if args.f1_results else None,
+            "f1b_results_path": args.f1b_results,
+            "f1b_alpha":        args.f1b_alpha if args.f1b_results else None,
+            "f1b_consistency": (
+                {
+                    "mann_whitney_p":  f1b_consistency.get("mann_whitney_p"),
+                    "alpha":           f1b_consistency.get("alpha"),
+                    "f1b_significant": f1b_consistency.get("f1b_significant"),
+                }
+                if f1b_consistency is not None else None
+            ),
+            "l_t_mode":         args.l_t_mode,
+            "lens_kind":        args.lens_kind,
+            "f2b_population":   f2b_population,
+            "regime_thresholds": {
+                "p_final_high":  args.p_final_high,
+                "rs_strong_thr": args.rs_strong_thr,
+                "rs_f3_thr":     args.rs_f3_thr,
+                "peak_low_thr":  args.peak_low_thr,
+            },
+            "verdict_counts": verdict_counts,
+            "per_instance":   verdicts,
+        }
+        with open(out_dir / "f2_verdicts.json", "w") as f:
+            json.dump(verdict_output, f, indent=2, ensure_ascii=False)
 
     print("\n" + "=" * 60)
     print("F2 Diagnostic complete. Results saved to:", out_dir)

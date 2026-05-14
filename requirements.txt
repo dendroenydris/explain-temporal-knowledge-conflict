@@ -8,7 +8,8 @@ mwparserfromhell>=0.6.6
 # ── TATM experiments (Phase 2) ────────────────────────────────────────────────
 
 # Core ML
-torch>=2.1.0
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
 transformers>=4.51,<5.0       # TL 2.x phi-3 weight conversion breaks on transformers 5.x
 accelerate>=0.26.0          # required by transformers for device_map / MPS offload
 huggingface-hub>=0.20.0     # model downloads

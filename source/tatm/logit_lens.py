@@ -33,11 +33,18 @@ class LogitTrajectory:
 
 # ── Core ──────────────────────────────────────────────────────────────────────
 
+# Module-level flag so the "tuned not implemented" warning only fires once
+# per process even if many trajectories are computed in a loop.
+_TUNED_WARN_ISSUED = False
+
+
 def run_logit_lens(
     model: HookedTransformer,
     tokens: torch.Tensor,
     answer_new_token: int,
     answer_old_token: int,
+    *,
+    lens_kind: str = "raw",
 ) -> LogitTrajectory:
     """Run Logit Lens on a single prompt.
 
@@ -51,7 +58,34 @@ def run_logit_lens(
     tokens : ``[1, seq_len]`` token IDs (already formatted, no BOS needed)
     answer_new_token : vocabulary index of the first token of ``answer_new``
     answer_old_token : vocabulary index of the first token of ``answer_old``
+    lens_kind : ``"raw"`` (default) or ``"tuned"``.  Methodology F3-a Step 3
+        specifies **Tuned Lens** (Belrose 2023) as the primary lens with
+        the raw RMSNorm-scaled lens reported as appendix robustness.  The
+        ``"tuned"`` path requires per-layer affine probes that are *not
+        yet trained* in this repository; selecting it currently falls
+        back to raw lens and emits a one-time warning so downstream
+        callers see that the lens choice was not honoured.
     """
+    global _TUNED_WARN_ISSUED
+    if lens_kind == "tuned":
+        if not _TUNED_WARN_ISSUED:
+            import warnings
+            warnings.warn(
+                "Tuned Lens (Belrose 2023) was requested but is not yet "
+                "implemented in tatm.logit_lens; falling back to raw lens. "
+                "Methodology F3-a Step 3 specifies Tuned Lens as the "
+                "primary lens — results downstream are appendix-grade "
+                "until per-layer affine Tuned-Lens probes are trained "
+                "and shipped under tatm.tuned_lens.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _TUNED_WARN_ISSUED = True
+        lens_kind = "raw"
+    elif lens_kind != "raw":
+        raise ValueError(
+            f"lens_kind must be 'raw' or 'tuned', got {lens_kind!r}"
+        )
     n_layers = model.cfg.n_layers
     W_U = model.W_U                       # [d_model, d_vocab]
     has_b_U = model.b_U is not None and model.b_U.abs().sum() > 0

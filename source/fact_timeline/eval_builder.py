@@ -133,13 +133,23 @@ _REL_LANG_DEFAULT: dict[str, str] = {
     "verb_changed": "{subject}'s {rel} changed to {obj}",
 }
 
-# Matches the whole temporal phrase, e.g.:
-#   "As of 2023,"  "In 2010,"  "Since 2005–06"  "2021"  "July2006"
-# The leading preposition clause is optional and consumed when present.
+# Matches a bare 4-digit year token (1900-2099) with light morphological
+# handling for "2015's", "mid-2015", "2015–2018" (decade shorthand like
+# "'90s" is intentionally left untouched).  Per methodology Step 2(c) the
+# replacement is **position-preserving**: only the 4-digit year token is
+# substituted with the literal lexical placeholder "<YEAR>".  The
+# surrounding scaffolding ("As of", "In", commas, etc.) is preserved so
+# that F1-b can measure attention at the same residual-stream position
+# the year occupied in B1.
 _YEAR_RE = re.compile(
-    r"(?:(?:As of|In|Since|From|Until|By)\s+)?(?<!\d)(19|20)\d{2}(?:[-–/]\d{2,4})?(?!\d),?",
-    re.IGNORECASE,
+    r"(?<!\d)(?:19|20)\d{2}(?!\d)",
 )
+
+# Lexical placeholder for stripped year tokens.  Deliberately not a special
+# token id — Phi-3 / LLaMA-2 tokenisers split it into ordinary sub-words so
+# it does not itself become a high-salience attention target (a single
+# special token would contaminate the very signal F1-b removes).
+YEAR_PLACEHOLDER = "<YEAR>"
 
 
 def _lang(relation: str) -> dict[str, str]:
@@ -175,18 +185,22 @@ def _evidence_for_year(tl: FactTimeline, year: int) -> tuple[str, str]:
 
 
 def _strip_years(text: str) -> str:
-    """Delete temporal phrases from evidence text (for B3/B4 weak-context variants).
+    """Position-preserving year-token replacement (methodology Step 2(c)).
 
-    Deletes whole phrases such as "As of 2023," and "In 2010," rather than
-    substituting a placeholder like "recently", which would itself be a
-    temporal cue (implying recency).
+    Every 4-digit year token is replaced with the lexical placeholder
+    ``"<YEAR>"`` (not deleted, and not replaced with a content word like
+    "recently" which would itself be a temporal cue).  Surrounding
+    scaffolding ("As of ", commas, etc.) is preserved verbatim so the
+    placeholder occupies the same residual-stream slot the year occupied
+    in the corresponding B1 / B5 prompt.  This is required for:
+
+      * F1-b's "attention at temporal heads to the <YEAR> placeholder
+        positions" comparison against B1's year-token attention.
+      * F1-c's matched-position controls.
+      * F2-a's STR activation patching (identical token counts pre/post
+        year-swap).
     """
-    result = _YEAR_RE.sub("", text)
-    result = re.sub(r"\s{2,}", " ", result)   # collapse gaps left by deletion
-    result = re.sub(r"\s+,", ",", result)     # "Labour ," → "Labour,"
-    result = re.sub(r"\s+\.", ".", result)    # "January ." → "January."
-    result = re.sub(r"\s+\)", ")", result)    # "born )" → "born)"
-    return result.strip()
+    return _YEAR_RE.sub(YEAR_PLACEHOLDER, text).strip()
 
 
 # ── Change-pair selection ─────────────────────────────────────────────────────
@@ -426,16 +440,16 @@ def build_eval_instances(tl: FactTimeline) -> list[EvalInstance]:
         # ── B: Context-Memory Conflict (context = real Wikipedia evidence) ───
         _inst("B1", q_explicit, ctx_b_strong, "strong", True,  f"As of {t_new}", "context_override", "use_context"),
         _inst("B2", q_implicit, ctx_b_strong, "strong", True,  f"As of {t_new}", "context_override", "use_context"),
-        _inst("B3", q_explicit, ctx_b_weak,   "weak",   False, "recently",       "context_override", "use_context"),
+        _inst("B3", q_explicit, ctx_b_weak,   "weak",   False, YEAR_PLACEHOLDER, "context_override", "use_context"),
         _inst("B4", q_plain,    ctx_b_weak,   "weak",   False, "",               "context_override", "use_context"),
         # B5: multi-span strong — both t_old and t_new evidence shown with years.
         # Model must use the year to select answer_new over answer_old.
         # This is the correct testbed for F1 (temporal attention) diagnosis.
-        _inst("B5", q_explicit, ctx_b_multi,              "multi",      True,  f"As of {t_new}", "context_override", "use_context"),
+        _inst("B5", q_explicit, ctx_b_multi,              "multi",      True,  f"As of {t_new}",  "context_override", "use_context"),
         # B6: multi-span weak — same dual-span context but all years stripped.
         # Paired with B5 exactly as B3 is paired with B1.  If the model
         # succeeds on B6 it cannot have used the year token at all.
-        _inst("B6", q_explicit, _strip_years(ctx_b_multi), "multi_weak", False, "recently",       "context_override", "use_context"),
+        _inst("B6", q_explicit, _strip_years(ctx_b_multi), "multi_weak", False, YEAR_PLACEHOLDER,  "context_override", "use_context"),
 
         # ── C: Mechanistic Probes ────────────────────────────────────────────
         _inst("C1", q_explicit, ctx_adv,  "strong", True,  f"As of {t_new}", "ablation", "use_memory"),
