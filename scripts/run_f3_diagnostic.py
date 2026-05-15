@@ -530,6 +530,14 @@ def main() -> None:
     R_param_other: list[tuple[int, int]] = []
     if "f3half" not in args.skip:
         fail_old, fail_other = _stratify_failure_traj(prepared)
+        fail_traj_pool = fail_old + fail_other
+        print(
+            "\n[F3 cohort counts] "
+            f"B1-success={sum(i.b1_success is True for i in prepared)}  "
+            f"B1-failure={sum(i.b1_success is False for i in prepared)}  "
+            f"failure_F3traj_PARAM_OLD={len(fail_old)}  "
+            f"failure_F3traj_PARAM_OTHER={len(fail_other)}"
+        )
         f3_half = run_f3_half_bridge(
             model, partitions["A"], fail_old, fail_other,
             template=args.template, lens_kind=args.lens_kind, H_T=H_T,
@@ -555,6 +563,19 @@ def main() -> None:
         print(f"\n[F3-0.5] rule={f3_half.selection_rule} |R|={len(R_pooled)} "
               f"panel_asymmetric={f3_half.panel_asymmetric} "
               f"ω={f3_half.omega_pooled:.2f}")
+        if not fail_traj_pool:
+            raise SystemExit(
+                "[ERROR] F3 cannot continue: no B1-failure F3-trajectory "
+                "instances in PARAM_OLD/PARAM_OTHER after F3-a. "
+                "Increase MAX_INSTANCES, run the full 1000-item dataset, or "
+                "lower --tau for an exploratory diagnostic."
+            )
+        if not R_pooled:
+            raise SystemExit(
+                "[ERROR] F3 cannot continue: F3-0.5 produced an empty routing "
+                "set R. Increase MAX_INSTANCES or inspect f3a_trajectory.json "
+                "and f3_half_attribution.json."
+            )
 
     # ── F3-b ─────────────────────────────────────────────────────────
     f3b_res = None

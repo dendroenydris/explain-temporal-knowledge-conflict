@@ -20,8 +20,11 @@ MODEL="${MODEL:-microsoft/phi-3-mini-4k-instruct}"
 MODEL_TAG="${MODEL_TAG:-phi3}"
 TEMPLATE="${TEMPLATE:-phi3}"
 OUT_DIR="${OUT_DIR:-results/f2_diagnostic_1000_${MODEL_TAG}}"
-TEMPORAL_HEADS="${TEMPORAL_HEADS:-data/external/temporal_heads/paper_temporal_heads.json}"
+TEMPORAL_HEADS_FILE="${TEMPORAL_HEADS_FILE:-data/external/temporal_heads/paper_temporal_heads.json}"
+TEMPORAL_HEADS_MANUAL="${TEMPORAL_HEADS_MANUAL:-10,13}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
+DTYPE="${DTYPE:-auto}"
+F2B_POPULATION="${F2B_POPULATION:-reverts_old}"
 
 command -v conda >/dev/null || {
   echo "[ERROR] conda not found. Run setup-conda3 on the cluster, then create ${CONDA_ENV_NAME} from environment.yml." >&2
@@ -36,12 +39,6 @@ conda activate "${CONDA_ENV_NAME}"
   exit 1
 }
 
-[ -f "${TEMPORAL_HEADS}" ] || {
-  echo "[ERROR] Missing temporal heads file: ${TEMPORAL_HEADS}" >&2
-  echo "Expected the paper-derived temporal heads file at data/external/temporal_heads/paper_temporal_heads.json" >&2
-  exit 1
-}
-
 ARGS=()
 if [ -n "${MAX_INSTANCES:-}" ]; then
   ARGS+=(--max-instances "${MAX_INSTANCES}")
@@ -52,20 +49,39 @@ fi
 if [ -n "${SAMPLE_SEED:-}" ]; then
   ARGS+=(--sample-seed "${SAMPLE_SEED}")
 fi
+if [ -n "${SKIP:-}" ]; then
+  # shellcheck disable=SC2206
+  ARGS+=(--skip ${SKIP})
+fi
+
+if [ -f "${TEMPORAL_HEADS_FILE}" ]; then
+  HEAD_ARGS=(--temporal-heads "${TEMPORAL_HEADS_FILE}")
+else
+  # shellcheck disable=SC2206
+  HEAD_ARGS=(--temporal-heads-manual ${TEMPORAL_HEADS_MANUAL})
+fi
 
 echo "MODEL=${MODEL}"
 echo "MODEL_TAG=${MODEL_TAG}"
 echo "TEMPLATE=${TEMPLATE}"
-echo "TEMPORAL_HEADS=${TEMPORAL_HEADS}"
+echo "TEMPORAL_HEADS_FILE=${TEMPORAL_HEADS_FILE}"
+echo "TEMPORAL_HEADS_MANUAL=${TEMPORAL_HEADS_MANUAL}"
+echo "DTYPE=${DTYPE}"
+echo "F2B_POPULATION=${F2B_POPULATION}"
+echo "MAX_INSTANCES=${MAX_INSTANCES:-<all>}"
+echo "SKIP=${SKIP:-<none>}"
 echo "OUT_DIR=${OUT_DIR}"
 
 python scripts/run_f2_diagnostic.py \
   --data "${DATA_JSONL}" \
   --model "${MODEL}" \
   --template "${TEMPLATE}" \
-  --temporal-heads "${TEMPORAL_HEADS}" \
+  "${HEAD_ARGS[@]}" \
   --out "${OUT_DIR}" \
-  "${ARGS[@]}"
+  --dtype "${DTYPE}" \
+  --f2b-population "${F2B_POPULATION}" \
+  "${ARGS[@]}" \
+  "$@"
 
 python - <<PY
 from pathlib import Path
