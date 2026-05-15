@@ -1,0 +1,282 @@
+#!/bin/bash
+#SBATCH --partition=aisc-batch
+#SBATCH --job-name=tatm_f3_phi3
+#SBATCH --account=aisc
+#SBATCH --nodes=1
+#SBATCH --exclude=ga03
+#SBATCH --gres=gpu:1
+#SBATCH --mem=96G
+#SBATCH --time=48:00:00
+#SBATCH --output=logs/tatm_f3_phi3_%j.out
+#SBATCH --error=logs/tatm_f3_phi3_%j.err
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F3 Diagnostic — full pipeline (F3-a → F3-0.5 → F3-b → F3-c Z + M protocols)
+#
+# Resource rationale (vs Stage-1/2 which use 48G / 24h):
+#   • Phi-3-mini float32: ~15 GB VRAM, loaded once for the entire job
+#   • F3-a activation cache: 1000 instances × 32 layers × 3 sublayer positions
+#     × hidden_dim(2048) × float32 ≈ 24 GB peak RAM before per-instance release
+#   • F3-b: 20 random-baseline samples × dual (M)/(Z) protocol = 40 extra
+#     forward passes per failure instance; runs after F3-a cache is released
+#   • F3-c Step 1 (L*_σ on S) + Step 2-3 (2×2 on T) + Step 4 (W_U projection):
+#     each instance stored temporarily; peak is 2-arm × 2-panel simultaneous
+#   • Total wall-clock: F3-a ~2h + F3-0.5 ~3h + F3-b ~4h + F3-c ~8h = ~17-24h
+#     48h gives headroom for queue delays and Tuned Lens training (~2h)
+#   • 96G RAM: 64G working headroom above model + 32G activation buffers
+#   • Disk: F3-c per-(σ,panel) JSONs + F3-a per-instance trajectories ≈ 2-5 GB;
+#     SLURM_TMPDIR is used for Tuned Lens checkpoint cache to avoid NFS pressure
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+mkdir -p logs results
+
+# ── Configurable defaults (override via env on sbatch call) ──────────────────
+
+LAYER2_JSONL="${LAYER2_JSONL:-data/processed/wikidata_layer2_1000.jsonl}"
+LAYER3_JSONL="${LAYER3_JSONL:-data/processed/wikidata_layer3_phi3_1000.jsonl}"
+LAYER4_JSONL="${LAYER4_JSONL:-data/processed/wikidata_layer4_phi3_1000.jsonl}"
+
+MODEL="${MODEL:-microsoft/phi-3-mini-4k-instruct}"
+MODEL_TAG="${MODEL_TAG:-phi3}"
+TEMPLATE="${TEMPLATE:-phi3}"
+
+# Park (2025) a10.h13 for Phi-3-mini; override with F1-b output if available
+TEMPORAL_HEADS="${TEMPORAL_HEADS:-10:13}"
+
+OUT_DIR="${OUT_DIR:-results/f3_diagnostic_1000_${MODEL_TAG}}"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
+
+# F3 knobs
+TAU="${TAU:-0.10}"
+LENS_KIND="${LENS_KIND:-tuned}"
+PARTITION_A_SIZE="${PARTITION_A_SIZE:-100}"
+F3B_RANDOM_SAMPLES="${F3B_RANDOM_SAMPLES:-20}"
+SAMPLE_SEED="${SAMPLE_SEED:-42}"
+
+# Maximum number of instances to process from the dataset.
+# Leave empty (default) to use all instances in LAYER2_JSONL.
+# Set to a smaller number (e.g. MAX_INSTANCES=100) for a quick smoke-test run.
+MAX_INSTANCES="${MAX_INSTANCES:-}"
+
+# ── Tuned Lens cache on fast local scratch (avoids NFS write pressure) ───────
+if [ -n "${SLURM_TMPDIR:-}" ]; then
+    export TUNED_LENS_CACHE="${SLURM_TMPDIR}/tuned_lens_cache"
+    mkdir -p "${TUNED_LENS_CACHE}"
+    echo "Tuned Lens cache: ${TUNED_LENS_CACHE}"
+fi
+
+# ── Disk space check (need ≥ 10 GB free on the output filesystem) ────────────
+_avail_kb=$(df --output=avail "$(dirname "${OUT_DIR}")" 2>/dev/null | tail -1 || echo 0)
+if [ "${_avail_kb}" -lt 10485760 ] 2>/dev/null; then
+    echo "[WARNING] Less than 10 GB free on output filesystem (${_avail_kb} kB available)."
+    echo "  F3-a per-instance trajectories + F3-c outputs may require 3-6 GB."
+    echo "  Continuing, but watch disk usage."
+fi
+
+# ── Conda ────────────────────────────────────────────────────────────────────
+command -v conda >/dev/null || {
+    echo "[ERROR] conda not found. Run setup-conda3 on the cluster, then create ${CONDA_ENV_NAME} from environment.yml." >&2
+    exit 1
+}
+eval "$(conda shell.bash hook)"
+conda activate "${CONDA_ENV_NAME}"
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+[ -f "${LAYER2_JSONL}" ] || {
+    echo "[ERROR] Missing Layer-2 file: ${LAYER2_JSONL}" >&2
+    echo "  Build with: python scripts/build_wikidata_layer2.py --layer1 data/processed/wikidata_layer1_1000.jsonl --out ${LAYER2_JSONL} --layers B1 B5" >&2
+    exit 1
+}
+[ -f "${LAYER3_JSONL}" ] || {
+    echo "[ERROR] Missing Layer-3 (A1 parametric answers): ${LAYER3_JSONL}" >&2
+    echo "  Build with: LAYERS=A1 sbatch build_wikidata_layer3_1000.sh" >&2
+    exit 1
+}
+[ -f "${LAYER4_JSONL}" ] || {
+    echo "[WARNING] Layer-4 behavior labels not found: ${LAYER4_JSONL}" >&2
+    echo "  F3 will fall back to online B1 generation (slower; adds ~2h)." >&2
+    echo "  Build with: LAYERS=B1 sbatch build_wikidata_layer4_1000.sh" >&2
+    LAYER4_ARG=""
+} && LAYER4_ARG="--layer4 ${LAYER4_JSONL}"
+
+echo "──────────────────────────────────────────────────────────────"
+echo " F3 Diagnostic — Phi-3-mini"
+echo " MODEL        : ${MODEL}"
+echo " MODEL_TAG    : ${MODEL_TAG}"
+echo " TEMPLATE     : ${TEMPLATE}"
+echo " LAYER2       : ${LAYER2_JSONL}"
+echo " LAYER3       : ${LAYER3_JSONL}"
+echo " LAYER4       : ${LAYER4_JSONL:-<not provided, online fallback>}"
+echo " TEMP. HEADS  : ${TEMPORAL_HEADS}"
+echo " OUT_DIR      : ${OUT_DIR}"
+echo " TAU          : ${TAU}"
+echo " LENS         : ${LENS_KIND}"
+echo " PARTITION A  : ${PARTITION_A_SIZE}"
+echo " F3B RANDOMS  : ${F3B_RANDOM_SAMPLES}"
+echo " SEED         : ${SAMPLE_SEED}"
+echo " MAX_INSTANCES: ${MAX_INSTANCES:-<all>}"
+echo "──────────────────────────────────────────────────────────────"
+
+# ── Optional extra CLI passthrough ───────────────────────────────────────────
+ARGS=()
+if [ -n "${MAX_INSTANCES}" ]; then ARGS+=(--max-instances "${MAX_INSTANCES}"); fi
+if [ -n "${NUMBER:-}" ];      then ARGS+=(--number "${NUMBER}"); fi
+# Pass F1-b results file if available (overrides --temporal-heads with H_T_heads key)
+if [ -n "${F1B_RESULTS:-}" ] && [ -f "${F1B_RESULTS}" ]; then
+    ARGS+=(--f1b-results "${F1B_RESULTS}")
+fi
+# Override ell_HT if pre-computed
+if [ -n "${ELL_HT:-}" ]; then ARGS+=(--ell-HT "${ELL_HT}"); fi
+
+mkdir -p "${OUT_DIR}"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — F3-a + F3-0.5 + F3-b + F3-c (Z protocol)
+# Methodology §F3: primary Late-KO protocol = Z for first run
+# ═════════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "[$(date '+%H:%M:%S')] Starting F3 — Protocol Z (primary)"
+
+# shellcheck disable=SC2086
+python scripts/run_f3_diagnostic.py \
+    --data            "${LAYER2_JSONL}" \
+    --layer3          "${LAYER3_JSONL}" \
+    ${LAYER4_ARG:-} \
+    --model           "${MODEL}" \
+    --template        "${TEMPLATE}" \
+    --temporal-heads  "${TEMPORAL_HEADS}" \
+    --out             "${OUT_DIR}" \
+    --tau             "${TAU}" \
+    --lens-kind       "${LENS_KIND}" \
+    --partition-A-size "${PARTITION_A_SIZE}" \
+    --f3b-random-samples "${F3B_RANDOM_SAMPLES}" \
+    --f3c-arms        attn mlp \
+    --f3c-late-protocol Z \
+    --sample-seed     "${SAMPLE_SEED}" \
+    --dtype           float32 \
+    "${ARGS[@]}" \
+    "$@"
+
+echo "[$(date '+%H:%M:%S')] Phase 1 (Z protocol) complete."
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — F3-c (M protocol) — methodology requires both (M) and (Z)
+# Skip F3-a / F3-0.5 / F3-b (already done); only re-run F3-c with M Late-KO.
+# Results go into a sibling directory so Phase 1 outputs are not overwritten.
+# ═════════════════════════════════════════════════════════════════════════════
+
+OUT_DIR_M="${OUT_DIR}_M"
+mkdir -p "${OUT_DIR_M}"
+
+# Symlink Phase-1 upstream outputs so Phase-2 can resolve partition/routing data.
+for f in f3_manifest.json f3_b1_behavior.json f3a_trajectory.json \
+          f3a_partition.json f3_half_attribution.json f3b_ablation.json \
+          f3c_step1_l_star.json; do
+    src="${OUT_DIR}/${f}"
+    dst="${OUT_DIR_M}/${f}"
+    [ -f "${src}" ] && [ ! -e "${dst}" ] && ln -s "$(realpath "${src}")" "${dst}"
+done
+
+echo ""
+echo "[$(date '+%H:%M:%S')] Starting F3-c — Protocol M (methodology completeness)"
+
+# shellcheck disable=SC2086
+python scripts/run_f3_diagnostic.py \
+    --data            "${LAYER2_JSONL}" \
+    --layer3          "${LAYER3_JSONL}" \
+    ${LAYER4_ARG:-} \
+    --model           "${MODEL}" \
+    --template        "${TEMPLATE}" \
+    --temporal-heads  "${TEMPORAL_HEADS}" \
+    --out             "${OUT_DIR_M}" \
+    --tau             "${TAU}" \
+    --lens-kind       "${LENS_KIND}" \
+    --partition-A-size "${PARTITION_A_SIZE}" \
+    --f3b-random-samples "${F3B_RANDOM_SAMPLES}" \
+    --f3c-arms        attn mlp \
+    --f3c-late-protocol M \
+    --skip            f3a f3half f3b \
+    --sample-seed     "${SAMPLE_SEED}" \
+    --dtype           float32 \
+    "${ARGS[@]}"
+
+echo "[$(date '+%H:%M:%S')] Phase 2 (M protocol) complete."
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 3 — Plotting
+# ═════════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "[$(date '+%H:%M:%S')] Generating plots"
+
+python scripts/plot_f3_results.py \
+    --f3-dir    "${OUT_DIR}" \
+    --f3-dir-m  "${OUT_DIR_M}" \
+    --out       "${OUT_DIR}/plots" \
+    --model-tag "${MODEL_TAG}" \
+    --tau       "${TAU}" 2>/dev/null || {
+        echo "[WARNING] plot_f3_results.py failed or missing --f3-dir-m support; skipping plots."
+    }
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 4 — Output verification
+# ═════════════════════════════════════════════════════════════════════════════
+
+python - <<PY
+import json, sys
+from pathlib import Path
+
+out_z = Path("${OUT_DIR}")
+out_m = Path("${OUT_DIR_M}")
+
+required_z = [
+    "f3_manifest.json",
+    "f3a_trajectory.json",
+    "f3a_partition.json",
+    "f3_half_attribution.json",
+    "f3b_ablation.json",
+    "f3c_step1_l_star.json",
+    "f3_verdict.json",
+]
+required_m = [
+    "f3_verdict.json",
+]
+
+missing = []
+for f in required_z:
+    p = out_z / f
+    if not p.exists():
+        missing.append(str(p))
+for f in required_m:
+    p = out_m / f
+    if not p.exists():
+        missing.append(str(p))
+
+if missing:
+    print("[ERROR] F3 finished but outputs missing:")
+    for m in missing:
+        print(f"  {m}")
+    sys.exit(1)
+
+# Print final verdict
+verdict_path = out_z / "f3_verdict.json"
+with open(verdict_path) as fh:
+    v = json.load(fh)
+print("")
+print("══ F3 Final Verdict (Z protocol) ══════════════════════════")
+print(f"  Title      : {v.get('title', '?')}")
+print(f"  Routed     : {v.get('routed', '?')}")
+print(f"  Overridden : {v.get('overridden', '?')}")
+print(f"  Chain      : {v.get('chain', '?')}")
+print(f"  Content    : {v.get('content', '?')}")
+print(f"  Panel asym : {v.get('panel_asymmetry', '?')}")
+print("════════════════════════════════════════════════════════════")
+print("")
+print("[OK] All required outputs present.")
+print(f"  Z results : {out_z}")
+print(f"  M results : {out_m}")
+PY
