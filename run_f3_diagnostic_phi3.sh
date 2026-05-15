@@ -5,8 +5,9 @@
 #SBATCH --nodes=1
 #SBATCH --exclude=ga03
 #SBATCH --gres=gpu:1
-#SBATCH --mem=96G
-#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=160G
+#SBATCH --time=72:00:00
 #SBATCH --output=logs/tatm_f3_phi3_%j.out
 #SBATCH --error=logs/tatm_f3_phi3_%j.err
 
@@ -14,16 +15,17 @@
 # F3 Diagnostic — full pipeline (F3-a → F3-0.5 → F3-b → F3-c Z + M protocols)
 #
 # Resource rationale (vs Stage-1/2 which use 48G / 24h):
-#   • Phi-3-mini float32: ~15 GB VRAM, loaded once for the entire job
-#   • F3-a activation cache: 1000 instances × 32 layers × 3 sublayer positions
-#     × hidden_dim(2048) × float32 ≈ 24 GB peak RAM before per-instance release
+#   • Phi-3-mini float16: ~7.5 GB VRAM, loaded once for the entire job
+#   • F3 disables TransformerLens per-head hook_result materialization; otherwise
+#     F3-a attention creates >25 GB intermediates and OOMs on 24 GB GPUs.
+#   • F3-a stores scalar trajectories only; CPU RAM is reserved for JSON buffers,
+#     donor means, partition metadata, and plotting.
 #   • F3-b: 20 random-baseline samples × dual (M)/(Z) protocol = 40 extra
 #     forward passes per failure instance; runs after F3-a cache is released
 #   • F3-c Step 1 (L*_σ on S) + Step 2-3 (2×2 on T) + Step 4 (W_U projection):
 #     each instance stored temporarily; peak is 2-arm × 2-panel simultaneous
-#   • Total wall-clock: F3-a ~2h + F3-0.5 ~3h + F3-b ~4h + F3-c ~8h = ~17-24h
-#     48h gives headroom for queue delays and Tuned Lens training (~2h)
-#   • 96G RAM: 64G working headroom above model + 32G activation buffers
+#   • Total wall-clock: 24-48h for 1000 items depending on context length.
+#   • 160G RAM gives headroom for full-result JSONs and plotting.
 #   • Disk: F3-c per-(σ,panel) JSONs + F3-a per-instance trajectories ≈ 2-5 GB;
 #     SLURM_TMPDIR is used for Tuned Lens checkpoint cache to avoid NFS pressure
 # ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +34,10 @@ set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 mkdir -p logs results
+
+# Reduce CUDA fragmentation on long multi-phase jobs.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 # ── Configurable defaults (override via env on sbatch call) ──────────────────
 
@@ -55,6 +61,7 @@ LENS_KIND="${LENS_KIND:-tuned}"
 PARTITION_A_SIZE="${PARTITION_A_SIZE:-100}"
 F3B_RANDOM_SAMPLES="${F3B_RANDOM_SAMPLES:-20}"
 SAMPLE_SEED="${SAMPLE_SEED:-42}"
+DTYPE="${DTYPE:-float16}"
 
 # Maximum number of instances to process from the dataset.
 # Leave empty (default) to use all instances in LAYER2_JSONL.
@@ -167,6 +174,7 @@ echo " TEMP. HEADS  : ${TEMPORAL_HEADS}"
 echo " OUT_DIR      : ${OUT_DIR}"
 echo " TAU          : ${TAU}"
 echo " LENS         : ${LENS_KIND}"
+echo " DTYPE        : ${DTYPE}"
 echo " PARTITION A  : ${PARTITION_A_SIZE}"
 echo " F3B RANDOMS  : ${F3B_RANDOM_SAMPLES}"
 echo " SEED         : ${SAMPLE_SEED}"
@@ -210,7 +218,7 @@ python scripts/run_f3_diagnostic.py \
     --f3c-arms        attn mlp \
     --f3c-late-protocol Z \
     --sample-seed     "${SAMPLE_SEED}" \
-    --dtype           float32 \
+    --dtype           "${DTYPE}" \
     "${ARGS[@]}" \
     "$@"
 
@@ -254,7 +262,7 @@ python scripts/run_f3_diagnostic.py \
     --f3c-late-protocol M \
     --skip            f3a f3half f3b \
     --sample-seed     "${SAMPLE_SEED}" \
-    --dtype           float32 \
+    --dtype           "${DTYPE}" \
     "${ARGS[@]}"
 
 echo "[$(date '+%H:%M:%S')] Phase 2 (M protocol) complete."
