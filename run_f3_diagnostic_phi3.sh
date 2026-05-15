@@ -113,7 +113,7 @@ with layer2_path.open(encoding="utf-8") as fh:
         if not line.strip():
             continue
         row = json.loads(line)
-        if str(row.get("layer2_type", "")) != "B1":
+        if not str(row.get("instance_id", "")).startswith("B1"):
             continue
         b1_keys.append(key(row))
         if max_instances is not None and len(b1_keys) >= max_instances:
