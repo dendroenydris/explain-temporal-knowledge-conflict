@@ -330,6 +330,39 @@ def _stratify_failure_traj(
     return old, other
 
 
+def _select_f3_failure_cohort(
+    instances: list[F3PreparedInstance],
+    *,
+    policy: str,
+) -> tuple[list[F3PreparedInstance], list[F3PreparedInstance], str]:
+    """Select the failure-side cohort for F3-0.5/F3-b/F3-c.
+
+    ``strict`` is the methodology-primary cohort:
+    B1-failure ∩ F3-trajectory ∩ {PARAM_OLD, PARAM_OTHER}.
+
+    ``relaxed`` drops only the F3-trajectory pre-filter while preserving the
+    conflict requirement.  It is useful when small samples have no strict
+    positives; downstream causal tests are still valid, but the run should be
+    read as exploratory rather than confirmatory F3.
+    """
+    strict_old, strict_other = _stratify_failure_traj(instances)
+    if policy == "strict" or strict_old or strict_other:
+        return strict_old, strict_other, "strict"
+
+    if policy not in {"auto", "relaxed"}:
+        raise ValueError(f"Unknown F3 failure cohort policy: {policy!r}")
+
+    relaxed_old = [
+        i for i in instances
+        if i.param_class == "PARAM_OLD" and i.b1_success is False
+    ]
+    relaxed_other = [
+        i for i in instances
+        if i.param_class == "PARAM_OTHER" and i.b1_success is False
+    ]
+    return relaxed_old, relaxed_other, "relaxed_no_trajectory_prefilter"
+
+
 def _split_S_T(
     pool: list[F3PreparedInstance], *, seed: int,
 ) -> tuple[list[F3PreparedInstance], list[F3PreparedInstance]]:
@@ -389,6 +422,13 @@ def main() -> None:
                         help="Override median temporal-head layer (else median(H_T))")
     parser.add_argument("--tau", type=float, default=0.10,
                         help="F3-a default τ (methodology line 374); sweep auto-includes 0.05/0.10/0.15")
+    parser.add_argument("--f3-failure-cohort", default="auto",
+                        choices=["auto", "strict", "relaxed"],
+                        help=("Failure-side cohort for F3-0.5/F3-b/F3-c. "
+                              "strict requires B1-failure ∩ F3-trajectory ∩ "
+                              "{PARAM_OLD,PARAM_OTHER}; auto falls back to "
+                              "relaxed (drops only the trajectory pre-filter) "
+                              "if strict is empty."))
 
     # F3-0.5 / F3-b knobs.
     parser.add_argument("--partition-A-size", type=int, default=100,
@@ -478,6 +518,7 @@ def main() -> None:
         "n_b1_loaded": len(b1_rows), "n_prepared": len(prepared),
         "lens_kind": args.lens_kind, "tau": args.tau,
         "temporal_heads": H_T, "ell_HT": ell_HT,
+        "f3_failure_cohort_policy": args.f3_failure_cohort,
         "seed": args.sample_seed, "skip": args.skip,
         "partition_A_size": args.partition_A_size,
         "f3c_arms": args.f3c_arms, "f3c_late_protocol": args.f3c_late_protocol,
@@ -528,18 +569,46 @@ def main() -> None:
     R_pooled: list[tuple[int, int]] = []
     R_param_old: list[tuple[int, int]] = []
     R_param_other: list[tuple[int, int]] = []
+    f3_failure_old: list[F3PreparedInstance] = []
+    f3_failure_other: list[F3PreparedInstance] = []
+    f3_failure_cohort_mode = "strict"
     if "f3half" not in args.skip:
-        fail_old, fail_other = _stratify_failure_traj(prepared)
-        fail_traj_pool = fail_old + fail_other
+        strict_old, strict_other = _stratify_failure_traj(prepared)
+        f3_failure_old, f3_failure_other, f3_failure_cohort_mode = (
+            _select_f3_failure_cohort(prepared, policy=args.f3_failure_cohort)
+        )
+        f3_failure_pool = f3_failure_old + f3_failure_other
+        b1_failures = [i for i in prepared if i.b1_success is False]
+        failure_traj = [i for i in b1_failures if i.is_f3_trajectory]
+        failure_by_class = {
+            cls: sum(1 for i in b1_failures if i.param_class == cls)
+            for cls in ("PARAM_OLD", "PARAM_OTHER", "PARAM_NEW")
+        }
+        failure_traj_by_class = {
+            cls: sum(1 for i in failure_traj if i.param_class == cls)
+            for cls in ("PARAM_OLD", "PARAM_OTHER", "PARAM_NEW")
+        }
         print(
             "\n[F3 cohort counts] "
             f"B1-success={sum(i.b1_success is True for i in prepared)}  "
-            f"B1-failure={sum(i.b1_success is False for i in prepared)}  "
-            f"failure_F3traj_PARAM_OLD={len(fail_old)}  "
-            f"failure_F3traj_PARAM_OTHER={len(fail_other)}"
+            f"B1-failure={len(b1_failures)}  "
+            f"failure_by_class={failure_by_class}  "
+            f"failure_F3traj_total={len(failure_traj)}  "
+            f"failure_F3traj_by_class={failure_traj_by_class}  "
+            f"strict_failure_F3traj_PARAM_OLD={len(strict_old)}  "
+            f"strict_failure_F3traj_PARAM_OTHER={len(strict_other)}  "
+            f"selected_failure_cohort={f3_failure_cohort_mode}  "
+            f"selected_PARAM_OLD={len(f3_failure_old)}  "
+            f"selected_PARAM_OTHER={len(f3_failure_other)}"
         )
+        if f3_failure_cohort_mode != "strict":
+            print(
+                "[F3 cohort warning] Strict F3 failure-trajectory cohort is empty; "
+                "continuing with relaxed exploratory cohort "
+                "B1-failure ∩ {PARAM_OLD, PARAM_OTHER}."
+            )
         f3_half = run_f3_half_bridge(
-            model, partitions["A"], fail_old, fail_other,
+            model, partitions["A"], f3_failure_old, f3_failure_other,
             template=args.template, lens_kind=args.lens_kind, H_T=H_T,
         )
         ell_R = (int(np.median([l for l, _ in f3_half.R_pooled]))
@@ -563,12 +632,12 @@ def main() -> None:
         print(f"\n[F3-0.5] rule={f3_half.selection_rule} |R|={len(R_pooled)} "
               f"panel_asymmetric={f3_half.panel_asymmetric} "
               f"ω={f3_half.omega_pooled:.2f}")
-        if not fail_traj_pool:
+        if not f3_failure_pool:
             raise SystemExit(
-                "[ERROR] F3 cannot continue: no B1-failure F3-trajectory "
-                "instances in PARAM_OLD/PARAM_OTHER after F3-a. "
-                "Increase MAX_INSTANCES, run the full 1000-item dataset, or "
-                "lower --tau for an exploratory diagnostic."
+                "[ERROR] F3 cannot continue: no B1-failure instances in "
+                "PARAM_OLD/PARAM_OTHER. This means the dataset does not contain "
+                "stale/other parametric conflict failures for F3; inspect Layer3 "
+                "A1 answers and B1 behavior."
             )
         if not R_pooled:
             raise SystemExit(
@@ -580,8 +649,7 @@ def main() -> None:
     # ── F3-b ─────────────────────────────────────────────────────────
     f3b_res = None
     if "f3b" not in args.skip and R_pooled:
-        fail_traj_pool = [i for i in prepared
-                          if i.b1_success is False and i.is_f3_trajectory]
+        fail_traj_pool = f3_failure_old + f3_failure_other
         f3b_res = run_f3b_ablation(
             model, fail_traj_pool, R_pooled,
             H_T=H_T,
@@ -598,10 +666,8 @@ def main() -> None:
     f3c_by_arm_panel: dict[tuple[str, str], Any] = {}
     f3c_content_by_arm_panel: dict[tuple[str, str], Any] = {}
     if "f3c" not in args.skip and R_pooled:
-        fail_traj_old   = [i for i in prepared if i.param_class == "PARAM_OLD"
-                           and i.b1_success is False and i.is_f3_trajectory]
-        fail_traj_other = [i for i in prepared if i.param_class == "PARAM_OTHER"
-                           and i.b1_success is False and i.is_f3_trajectory]
+        fail_traj_old = f3_failure_old
+        fail_traj_other = f3_failure_other
 
         S_old, T_old = _split_S_T(fail_traj_old, seed=args.sample_seed)
         S_other, T_other = _split_S_T(fail_traj_other, seed=args.sample_seed + 1)

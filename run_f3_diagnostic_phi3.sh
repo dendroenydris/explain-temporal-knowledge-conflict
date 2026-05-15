@@ -63,6 +63,7 @@ F3B_RANDOM_SAMPLES="${F3B_RANDOM_SAMPLES:-20}"
 SAMPLE_SEED="${SAMPLE_SEED:-42}"
 DTYPE="${DTYPE:-float16}"
 RUN_M_PROTOCOL="${RUN_M_PROTOCOL:-1}"
+F3_FAILURE_COHORT="${F3_FAILURE_COHORT:-auto}"
 
 # Maximum number of instances to process from the dataset.
 # Leave empty (default) to use all instances in LAYER2_JSONL.
@@ -177,6 +178,7 @@ echo " TAU          : ${TAU}"
 echo " LENS         : ${LENS_KIND}"
 echo " DTYPE        : ${DTYPE}"
 echo " RUN_M_PROTOCOL: ${RUN_M_PROTOCOL}"
+echo " F3_FAILURE_COHORT: ${F3_FAILURE_COHORT}"
 echo " PARTITION A  : ${PARTITION_A_SIZE}"
 echo " F3B RANDOMS  : ${F3B_RANDOM_SAMPLES}"
 echo " SEED         : ${SAMPLE_SEED}"
@@ -221,6 +223,7 @@ python scripts/run_f3_diagnostic.py \
     --f3c-late-protocol Z \
     --sample-seed     "${SAMPLE_SEED}" \
     --dtype           "${DTYPE}" \
+    --f3-failure-cohort "${F3_FAILURE_COHORT}" \
     "${ARGS[@]}" \
     "$@"
 
@@ -266,6 +269,7 @@ python scripts/run_f3_diagnostic.py \
     --f3c-late-protocol M \
     --sample-seed     "${SAMPLE_SEED}" \
     --dtype           "${DTYPE}" \
+    --f3-failure-cohort "${F3_FAILURE_COHORT}" \
     "${ARGS[@]}"
 
 echo "[$(date '+%H:%M:%S')] Phase 2 (full M protocol) complete."
