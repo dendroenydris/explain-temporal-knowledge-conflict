@@ -20,7 +20,7 @@ MODEL="${MODEL:-microsoft/phi-3-mini-4k-instruct}"
 MODEL_TAG="${MODEL_TAG:-phi3}"
 TEMPLATE="${TEMPLATE:-phi3}"
 OUT_JSONL="${OUT_JSONL:-data/processed/wikidata_layer3_${MODEL_TAG}_1000.jsonl}"
-LAYERS="${LAYERS:-B5}"
+LAYERS="${LAYERS:-A1}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 
 if [ -f "${HOME}/conda3/etc/profile.d/conda.sh" ]; then

@@ -95,12 +95,65 @@ conda activate "${CONDA_ENV_NAME}"
     echo "  Build with: LAYERS=A1 sbatch build_wikidata_layer3_1000.sh" >&2
     exit 1
 }
-[ -f "${LAYER4_JSONL}" ] || {
+python - <<PY
+import json
+from pathlib import Path
+
+layer2_path = Path("${LAYER2_JSONL}")
+layer3_path = Path("${LAYER3_JSONL}")
+max_instances = "${MAX_INSTANCES}"
+max_instances = int(max_instances) if max_instances else None
+
+def key(row):
+    return (str(row.get("fact_id", "")), row.get("t_old"), row.get("t_new"))
+
+b1_keys = []
+with layer2_path.open(encoding="utf-8") as fh:
+    for line in fh:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if str(row.get("layer2_type", "")) != "B1":
+            continue
+        b1_keys.append(key(row))
+        if max_instances is not None and len(b1_keys) >= max_instances:
+            break
+
+a1_keys = set()
+a1_rows = 0
+with layer3_path.open(encoding="utf-8") as fh:
+    for line in fh:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if str(row.get("layer2_type", "")) != "A1":
+            continue
+        a1_rows += 1
+        a1_keys.add(key(row))
+
+overlap = sum(1 for k in b1_keys if k in a1_keys)
+if a1_rows == 0:
+    raise SystemExit(
+        "[ERROR] Layer-3 has 0 A1 rows. Rebuild it with:\n"
+        "  LAYERS=A1 OUT_JSONL=${LAYER3_JSONL} sbatch build_wikidata_layer3_1000.sh"
+    )
+if overlap == 0:
+    raise SystemExit(
+        "[ERROR] Layer-3 A1 rows do not overlap the selected B1 rows.\n"
+        f"  selected_B1={len(b1_keys)} A1_rows={a1_rows} overlap=0\n"
+        "  Rebuild Layer-3 from the same Layer-2 file and the same sample:\n"
+        "  LAYERS=A1 LAYER2_JSONL=${LAYER2_JSONL} OUT_JSONL=${LAYER3_JSONL} sbatch build_wikidata_layer3_1000.sh"
+    )
+print(f"[OK] Layer-3 A1 preflight: selected_B1={len(b1_keys)} A1_rows={a1_rows} overlap={overlap}")
+PY
+if [ -f "${LAYER4_JSONL}" ]; then
+    LAYER4_ARG="--layer4 ${LAYER4_JSONL}"
+else
     echo "[WARNING] Layer-4 behavior labels not found: ${LAYER4_JSONL}" >&2
     echo "  F3 will fall back to online B1 generation (slower; adds ~2h)." >&2
     echo "  Build with: LAYERS=B1 sbatch build_wikidata_layer4_1000.sh" >&2
     LAYER4_ARG=""
-} && LAYER4_ARG="--layer4 ${LAYER4_JSONL}"
+fi
 
 echo "──────────────────────────────────────────────────────────────"
 echo " F3 Diagnostic — Phi-3-mini"
