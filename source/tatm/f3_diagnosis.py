@@ -1890,7 +1890,7 @@ def _trajectory_with_hooks(
             probs = torch.softmax(proj, dim=-1)
             buf[layer] = float(probs.index_select(0, target_tid)[0])
             return resid
-        return _make
+        return _h
 
     lens_hooks = [
         (f"blocks.{l}.hook_resid_post", _make(l)) for l in range(n_layers)
