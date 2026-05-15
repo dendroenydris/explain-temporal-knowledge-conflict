@@ -441,7 +441,11 @@ def main() -> None:
         raise SystemExit(
             "[ERROR] F3 loaded the model on CPU. Run on a GPU node or pass "
             "--allow-cpu for tiny debugging runs.")
-    model.cfg.use_attn_result = True
+    # Do not enable per-head attention result materialization.  F3 only hooks
+    # hook_z / hook_attn_out / hook_mlp_out; use_attn_result=True makes
+    # TransformerLens build a huge [pos, head, d_head, d_model] intermediate
+    # in attention and OOMs on 24GB GPUs during F3-a.
+    model.cfg.use_attn_result = False
     print(f"  device={model_device}  {model.cfg.n_layers} layers x {model.cfg.n_heads} heads")
 
     layer3_by_id, layer3_by_key = load_layer3_by_key(args.layer3)
