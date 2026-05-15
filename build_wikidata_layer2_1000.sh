@@ -27,4 +27,4 @@ conda activate "${CONDA_ENV_NAME}"
 python scripts/build_wikidata_layer2.py \
   --layer1 data/processed/wikidata_layer1_1000.jsonl \
   --out data/processed/wikidata_layer2_1000.jsonl \
-  --layers B1 B3 B5 B6
+  --layers A1 B1 B3 B5 B6
