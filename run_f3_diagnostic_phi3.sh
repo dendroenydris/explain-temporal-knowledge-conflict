@@ -62,6 +62,7 @@ PARTITION_A_SIZE="${PARTITION_A_SIZE:-100}"
 F3B_RANDOM_SAMPLES="${F3B_RANDOM_SAMPLES:-20}"
 SAMPLE_SEED="${SAMPLE_SEED:-42}"
 DTYPE="${DTYPE:-float16}"
+RUN_M_PROTOCOL="${RUN_M_PROTOCOL:-1}"
 
 # Maximum number of instances to process from the dataset.
 # Leave empty (default) to use all instances in LAYER2_JSONL.
@@ -175,6 +176,7 @@ echo " OUT_DIR      : ${OUT_DIR}"
 echo " TAU          : ${TAU}"
 echo " LENS         : ${LENS_KIND}"
 echo " DTYPE        : ${DTYPE}"
+echo " RUN_M_PROTOCOL: ${RUN_M_PROTOCOL}"
 echo " PARTITION A  : ${PARTITION_A_SIZE}"
 echo " F3B RANDOMS  : ${F3B_RANDOM_SAMPLES}"
 echo " SEED         : ${SAMPLE_SEED}"
@@ -225,12 +227,14 @@ python scripts/run_f3_diagnostic.py \
 echo "[$(date '+%H:%M:%S')] Phase 1 (Z protocol) complete."
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — F3-c (M protocol) — methodology requires both (M) and (Z)
-# Skip F3-a / F3-0.5 / F3-b (already done); only re-run F3-c with M Late-KO.
+# PHASE 2 — Full F3 with M protocol — methodology requires both (M) and (Z).
+# This intentionally re-runs F3-a / F3-0.5 / F3-b inside OUT_DIR_M so the
+# M-protocol pass has its own in-process routing set R and final verdict.
 # Results go into a sibling directory so Phase 1 outputs are not overwritten.
 # ═════════════════════════════════════════════════════════════════════════════
 
 OUT_DIR_M="${OUT_DIR}_M"
+if [ "${RUN_M_PROTOCOL}" = "1" ]; then
 mkdir -p "${OUT_DIR_M}"
 
 # Symlink Phase-1 upstream outputs so Phase-2 can resolve partition/routing data.
@@ -243,7 +247,7 @@ for f in f3_manifest.json f3_b1_behavior.json f3a_trajectory.json \
 done
 
 echo ""
-echo "[$(date '+%H:%M:%S')] Starting F3-c — Protocol M (methodology completeness)"
+echo "[$(date '+%H:%M:%S')] Starting full F3 — Protocol M (methodology completeness)"
 
 # shellcheck disable=SC2086
 python scripts/run_f3_diagnostic.py \
@@ -260,12 +264,15 @@ python scripts/run_f3_diagnostic.py \
     --f3b-random-samples "${F3B_RANDOM_SAMPLES}" \
     --f3c-arms        attn mlp \
     --f3c-late-protocol M \
-    --skip            f3a f3half f3b \
     --sample-seed     "${SAMPLE_SEED}" \
     --dtype           "${DTYPE}" \
     "${ARGS[@]}"
 
-echo "[$(date '+%H:%M:%S')] Phase 2 (M protocol) complete."
+echo "[$(date '+%H:%M:%S')] Phase 2 (full M protocol) complete."
+else
+echo ""
+echo "[$(date '+%H:%M:%S')] Skipping Phase 2 (M protocol). Set RUN_M_PROTOCOL=1 to run it."
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE 3 — Plotting
@@ -274,12 +281,11 @@ echo "[$(date '+%H:%M:%S')] Phase 2 (M protocol) complete."
 echo ""
 echo "[$(date '+%H:%M:%S')] Generating plots"
 
-python scripts/plot_f3_results.py \
-    --f3-dir    "${OUT_DIR}" \
-    --f3-dir-m  "${OUT_DIR_M}" \
-    --out       "${OUT_DIR}/plots" \
-    --model-tag "${MODEL_TAG}" \
-    --tau       "${TAU}" 2>/dev/null || {
+PLOT_ARGS=(--f3-dir "${OUT_DIR}" --out "${OUT_DIR}/plots" --model-tag "${MODEL_TAG}" --tau "${TAU}")
+if [ "${RUN_M_PROTOCOL}" = "1" ] && [ -d "${OUT_DIR_M}" ]; then
+    PLOT_ARGS+=(--f3-dir-m "${OUT_DIR_M}")
+fi
+python scripts/plot_f3_results.py "${PLOT_ARGS[@]}" 2>/dev/null || {
         echo "[WARNING] plot_f3_results.py failed or missing --f3-dir-m support; skipping plots."
     }
 
@@ -293,6 +299,7 @@ from pathlib import Path
 
 out_z = Path("${OUT_DIR}")
 out_m = Path("${OUT_DIR_M}")
+run_m = "${RUN_M_PROTOCOL}" == "1"
 
 required_z = [
     "f3_manifest.json",
@@ -303,9 +310,7 @@ required_z = [
     "f3c_step1_l_star.json",
     "f3_verdict.json",
 ]
-required_m = [
-    "f3_verdict.json",
-]
+required_m = ["f3_verdict.json"] if run_m else []
 
 missing = []
 for f in required_z:
