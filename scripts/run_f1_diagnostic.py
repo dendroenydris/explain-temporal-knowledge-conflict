@@ -203,8 +203,16 @@ def restrict_instances(
     )
 
 
-def load_layer3_answers(path: str) -> dict[str, dict]:
-    """Load Layer-3 parametric answers keyed by Layer-2 instance_id."""
+def load_layer3_answers(path: str) -> tuple[dict[str, dict], dict[tuple, dict]]:
+    """Load Layer-3 parametric answers.
+
+    Returns
+    -------
+    by_iid  : dict keyed by instance_id  (e.g. "B1_abc123")
+    by_key  : dict keyed by (fact_id, t_old, t_new) — used as fallback when
+              the strong group is B5/B6 (different instance_id prefix but same
+              underlying fact as the B1 entry in Layer-3).
+    """
     layer3_path = Path(path)
     if not layer3_path.exists():
         raise FileNotFoundError(
@@ -212,7 +220,8 @@ def load_layer3_answers(path: str) -> dict[str, dict]:
             "Build it first with build_wikidata_layer3_1000.sh."
         )
 
-    answers: dict[str, dict] = {}
+    by_iid: dict[str, dict] = {}
+    by_key: dict[tuple, dict] = {}
     with open(layer3_path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -221,10 +230,17 @@ def load_layer3_answers(path: str) -> dict[str, dict]:
             row = json.loads(line)
             iid = row.get("instance_id")
             if iid:
-                answers[str(iid)] = row
-    if not answers:
+                by_iid[str(iid)] = row
+            fkey = (
+                str(row.get("fact_id", "")),
+                row.get("t_old"),
+                row.get("t_new"),
+            )
+            if fkey[0]:
+                by_key[fkey] = row
+    if not by_iid:
         raise ValueError(f"No Layer-3 answers found in {layer3_path}")
-    return answers
+    return by_iid, by_key
 
 
 # ── A1: Parametric memory filter ─────────────────────────────────────────────
@@ -233,7 +249,7 @@ def run_a1_filter(
     b1_instances: list[dict],
     b3_instances: list[dict],
     out_dir: Path,
-    layer3_answers: dict[str, dict],
+    layer3_answers: dict[str, dict] | tuple[dict[str, dict], dict[tuple, dict]],
     strong_label: str = "B1",
     weak_label: str = "B3",
 ) -> tuple[list[dict], list[dict]]:
@@ -244,7 +260,19 @@ def run_a1_filter(
     -------------------
     L3_KNOWS_NEW  : Layer-3 answer matches answer_new  → exclude
     L3_WRONG      : Layer-3 answer is other             → keep
+
+    ``layer3_answers`` can be either the plain dict returned by the old
+    ``load_layer3_answers`` signature, or the ``(by_iid, by_key)`` tuple
+    returned by the new one.  When the strong group is B5/B6 the instance_id
+    lookup misses (prefix differs from B1), so the fallback by
+    ``(fact_id, t_old, t_new)`` key is used instead — the underlying
+    parametric memory is identical for the same fact.
     """
+    if isinstance(layer3_answers, tuple):
+        by_iid, by_key = layer3_answers
+    else:
+        by_iid, by_key = layer3_answers, {}
+
     print("\n" + "=" * 60)
     print("Layer-3: Year-conditioned Parametric Memory Profiling")
     print("=" * 60)
@@ -263,7 +291,17 @@ def run_a1_filter(
         answer_old = inst.get("answer_old", "")
         iid        = inst.get("instance_id", "")
 
-        layer3_row = layer3_answers.get(iid)
+        # Primary: direct instance_id lookup (works when strong group is B1).
+        # Fallback: fact-key lookup so B5/B6 instances reuse the matching B1
+        # entry — parametric memory is a fact-level property, not instance-type.
+        layer3_row = by_iid.get(iid)
+        if layer3_row is None and by_key:
+            fkey = (
+                str(inst.get("fact_id", "")),
+                inst.get("t_old"),
+                inst.get("t_new"),
+            )
+            layer3_row = by_key.get(fkey)
         if layer3_row is None:
             missing_ids.append(iid)
             continue
@@ -1029,7 +1067,7 @@ def main():
     weak_label   = "B6" if args.b5 else "B3"
     print(f"\nLoaded {len(b1_instances)} {strong_label} instances, {len(b3_instances)} {weak_label} instances")
 
-    layer3_answers: dict[str, dict] = {}
+    layer3_answers: tuple[dict, dict] | dict = {}
     if not args.no_a1_filter:
         if not args.layer3:
             raise SystemExit(
@@ -1038,7 +1076,9 @@ def main():
                 "--no-a1-filter for debugging."
             )
         layer3_answers = load_layer3_answers(args.layer3)
-        print(f"Loaded {len(layer3_answers)} cached Layer-3 parametric answers")
+        by_iid, by_key = layer3_answers
+        print(f"Loaded {len(by_iid)} cached Layer-3 parametric answers "
+              f"({len(by_key)} indexed by fact key for cross-type lookup)")
 
     # load model
     print(f"\nLoading model {args.model}  (this may take 1–3 min on first run)…")

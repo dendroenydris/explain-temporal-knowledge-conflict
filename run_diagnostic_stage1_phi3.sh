@@ -68,7 +68,6 @@ python scripts/run_f1_diagnostic.py \
   --template "${TEMPLATE}" \
   --out "${OUT_DIR}" \
   --layer3 "${LAYER3_JSONL}" \
-  --b5 \
   "${ARGS[@]}" \
   "$@"
 

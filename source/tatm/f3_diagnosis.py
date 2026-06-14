@@ -450,6 +450,12 @@ class F3aTrajectoryResult:
 
     late_drop: float                   # P^{l_peak}(new) − min_{l > l_peak} P^l(new)
 
+    # Sublayer Δ stacks (last token) for ATTN + MLP, computed via raw lens.
+    delta_attn_new: np.ndarray = field(repr=False)
+    delta_mlp_new:  np.ndarray = field(repr=False)
+    delta_attn_param: np.ndarray = field(repr=False)
+    delta_mlp_param:  np.ndarray = field(repr=False)
+
     # ── Data-driven window (measurable redesign) ──────────────────────────────
     # Peak over ALL layers + peak-to-final drop.  This captures the late
     # rise-then-drop the fixed mid-window misses on crystallization models.
@@ -462,12 +468,6 @@ class F3aTrajectoryResult:
     rank_new_final: int = -1
     # Behavioral anchor (filled from b1_outputs_param; the F3 classifier).
     b1_outputs_param: Optional[bool] = None
-
-    # Sublayer Δ stacks (last token) for ATTN + MLP, computed via raw lens.
-    delta_attn_new: np.ndarray = field(repr=False)
-    delta_mlp_new:  np.ndarray = field(repr=False)
-    delta_attn_param: np.ndarray = field(repr=False)
-    delta_mlp_param:  np.ndarray = field(repr=False)
 
 
 def _trajectory_delta(
