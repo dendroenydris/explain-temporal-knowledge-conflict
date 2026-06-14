@@ -70,11 +70,13 @@ from tatm.f3_diagnosis import (  # noqa: E402
     prepare_f3_instances,
     run_f3a_trajectory,
     run_f3_half_bridge,
+    run_f3_late_window_intervention,
     run_f3b_ablation,
     run_f3c_step1_l_star,
     run_f3c_step2_3,
     run_f3c_step4_content,
     summarize_f3a_population,
+    summarize_failure_modes,
     to_jsonable,
 )
 from tatm.model import build_prompt, generate_answer, load_model  # noqa: E402
@@ -406,7 +408,7 @@ def main() -> None:
 
     # F3 sub-experiment toggles.
     parser.add_argument("--skip", nargs="*", default=[],
-                        choices=["f3a", "f3half", "f3b", "f3c"],
+                        choices=["f3a", "f3interv", "f3half", "f3b", "f3c"],
                         help="Skip F3 sub-experiments")
     parser.add_argument("--lens-kind", default="tuned", choices=["raw", "tuned"],
                         help="Lens for F3-a / F3-b / F3-c residual measurements "
@@ -549,6 +551,28 @@ def main() -> None:
         print(f"  reading: {f3a_summary.reading}")
         print(f"  traj rates: {f3a_summary.f3_traj_rate}")
         print(f"  align HT: {f3a_summary.align_HT_rate}")
+
+        # ── Spine: behavioral F1/F2/F3/Mixed distribution (measurable redesign) ──
+        mode_summary = summarize_failure_modes(f3a_results)
+        _write_json(out_dir / "f3a_failure_modes.json", mode_summary)
+        print("\n[F3-a] Failure-mode distribution (behavioral anchor):")
+        print(f"  counts: {mode_summary.counts}")
+        print(f"  F3 cohort n={mode_summary.f3_cohort_n}  "
+              f"mechanism hit-rate={mode_summary.f3_mechanism_hit_rate}")
+
+    # ── Spine: F3 causal main line — late-window span intervention ─────
+    if "f3interv" not in args.skip:
+        interv_results, interv_summary = run_f3_late_window_intervention(
+            model, prepared, template=args.template, seed=args.sample_seed,
+        )
+        _write_json(out_dir / "f3_intervention.json", {
+            "summary": interv_summary,
+            "per_instance": interv_results,
+        })
+        print("\n[F3 intervention] Recovery vs random-layer baseline:")
+        for s in interv_summary:
+            print(f"  {s.variant}: recovery={s.recovery_rate:.3f}  "
+                  f"random={s.random_recovery_rate:.3f}  delta={s.delta:+.3f}  (n={s.n})")
 
     # Partitions on B1-success.
     partitions = partition_b1_success_pool(

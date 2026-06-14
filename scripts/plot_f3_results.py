@@ -399,18 +399,72 @@ def collect_f3c_arm_panel(results_dir: Path, kind: str) -> list[tuple[str, str, 
     return out
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--results", required=True,
-                        help="Directory containing f3*.json outputs")
-    parser.add_argument("--out", default=None,
-                        help="Output directory for figures (defaults to results/figures)")
-    parser.add_argument("--figsize", nargs=2, type=float, default=[14, 13])
-    args = parser.parse_args()
+def panel_failure_modes(ax: plt.Axes, modes: dict | None) -> None:
+    """Spine panel: F1/F2/F3/Mixed distribution (behavioral-anchor classifier)."""
+    ax.set_title("Failure-mode distribution (spine)")
+    if not modes or not modes.get("counts"):
+        ax.text(0.5, 0.5, "no f3a_failure_modes.json", ha="center", va="center",
+                transform=ax.transAxes, color=C_GRAY)
+        ax.set_axis_off()
+        return
+    order = ["F1", "F2", "F3", "MIXED"]
+    counts = modes["counts"]
+    vals = [counts.get(k, 0) for k in order]
+    colors = [C_SKY, C_ORANGE, C_RED, C_GRAY]
+    ax.bar(order, vals, color=colors)
+    for i, v in enumerate(vals):
+        ax.text(i, v, str(v), ha="center", va="bottom", fontsize=9)
+    hit = modes.get("f3_mechanism_hit_rate")
+    n3 = modes.get("f3_cohort_n", 0)
+    sub = f"F3 cohort n={n3}"
+    if hit is not None:
+        sub += f", mechanism hit-rate={hit:.2f}"
+    ax.set_xlabel(sub)
+    ax.set_ylabel("# B1-failure instances")
 
-    results = Path(args.results)
-    out_dir = Path(args.out) if args.out else (results / "figures")
+
+def panel_intervention(ax: plt.Axes, interv: dict | None) -> None:
+    """Spine panel: late-window intervention recovery vs random-layer baseline."""
+    ax.set_title("F3 late-window intervention (spine)")
+    summ = (interv or {}).get("summary") or []
+    if not summ:
+        ax.text(0.5, 0.5, "no f3_intervention.json", ha="center", va="center",
+                transform=ax.transAxes, color=C_GRAY)
+        ax.set_axis_off()
+        return
+    variants = [s["variant"] for s in summ]
+    rec = [s["recovery_rate"] for s in summ]
+    rnd = [s["random_recovery_rate"] for s in summ]
+    x = np.arange(len(variants))
+    w = 0.38
+    ax.bar(x - w / 2, rec, w, label="intervention", color=C_GREEN)
+    ax.bar(x + w / 2, rnd, w, label="random-layer", color=C_GRAY)
+    ax.set_xticks(x)
+    ax.set_xticklabels(variants, rotation=15, ha="right")
+    ax.set_ylabel("answer_new recovery rate")
+    ax.set_ylim(0, 1)
+    ax.legend()
+
+
+def plot_spine(results: Path, out_dir: Path) -> None:
+    """Two-panel spine figure: failure modes + causal recovery (measurable redesign)."""
+    modes  = _load(results / "f3a_failure_modes.json")
+    interv = _load(results / "f3_intervention.json")
+    if modes is None and interv is None:
+        return
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
+    panel_failure_modes(ax1, modes)
+    panel_intervention(ax2, interv)
+    fig.suptitle("F3 measurable-redesign spine", fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    for ext in ("pdf", "png"):
+        fig.savefig(out_dir / f"f3_spine.{ext}")
+    plt.close(fig)
+    print(f"Saved: {out_dir / 'f3_spine.png'}")
+
+
+def render(results: Path, out_dir: Path, figsize: tuple[float, float]) -> None:
+    """Render the 6-panel figure + spine figure for one results directory."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
     f3a    = _load(results / "f3a_trajectory.json")
@@ -420,7 +474,7 @@ def main() -> None:
     f3c23  = collect_f3c_arm_panel(results, "step2_3")
     f3c4   = collect_f3c_arm_panel(results, "step4")
 
-    fig = plt.figure(figsize=tuple(args.figsize), constrained_layout=False)
+    fig = plt.figure(figsize=tuple(figsize), constrained_layout=False)
     gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.55, wspace=0.32,
                             left=0.07, right=0.97, top=0.93, bottom=0.07)
     ax_a = fig.add_subplot(gs[0, 0])
@@ -445,6 +499,39 @@ def main() -> None:
     plt.close(fig)
     print(f"Saved: {pdf_path}")
     print(f"Saved: {png_path}")
+
+    # Spine figure (measurable redesign): failure-mode distribution + causal recovery.
+    plot_spine(results, out_dir)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Accept both --f3-dir (used by run_f3_diagnostic_phi3.sh) and --results.
+    parser.add_argument("--f3-dir", "--results", dest="results", default=None,
+                        help="Directory containing f3*.json outputs (Z protocol)")
+    parser.add_argument("--f3-dir-m", dest="results_m", default=None,
+                        help="Optional M-protocol results directory; figures go to <out>/M")
+    parser.add_argument("--out", default=None,
+                        help="Output directory for figures (defaults to <results>/figures)")
+    parser.add_argument("--figsize", nargs=2, type=float, default=[14, 13])
+    # Accepted for shell compatibility; figure titles are taken from f3_verdict.json.
+    parser.add_argument("--model-tag", dest="model_tag", default=None,
+                        help="(accepted for compatibility; unused)")
+    parser.add_argument("--tau", type=float, default=None,
+                        help="(accepted for compatibility; unused)")
+    args = parser.parse_args()
+
+    if not args.results:
+        parser.error("one of --f3-dir / --results is required")
+
+    results = Path(args.results)
+    out_dir = Path(args.out) if args.out else (results / "figures")
+    render(results, out_dir, tuple(args.figsize))
+
+    if args.results_m:
+        results_m = Path(args.results_m)
+        render(results_m, out_dir / "M", tuple(args.figsize))
 
 
 if __name__ == "__main__":

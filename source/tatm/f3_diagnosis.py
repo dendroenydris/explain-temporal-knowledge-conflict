@@ -51,6 +51,8 @@ from transformer_lens import HookedTransformer
 
 from tatm.logit_lens import LogitTrajectory, run_logit_lens
 from tatm.model import (
+    _clean_generated,
+    _collect_eos_ids,
     build_prompt,
     check_match,
     find_year_positions,
@@ -64,6 +66,16 @@ from tatm.model import (
 #: F3-a default τ (methodology line 374).
 F3A_DEFAULT_TAU            = 0.10
 F3A_TAU_SWEEP              = (0.05, 0.10, 0.15)
+#: F3-a data-driven window (measurable redesign).  On late-crystallization
+#: models (Phi-3-mini, MHA) the answer_new rise-then-drop occurs in the late
+#: layers (~24-31), NOT the fixed mid-window [L/4, 2L/3]; the fixed window
+#: produced the all-zero F3-a result.  We therefore take the peak over ALL
+#: layers and define suppression as (peak − final).  ``F3A_DROP_TAU`` is the
+#: peak-to-final drop above which answer_new counts as "routed then suppressed".
+F3A_DROP_TAU              = 0.10
+#: Rank below which answer_new counts as "rank-competitive" (routed) at a layer
+#: — calibration-free readout, robust to crystallization (0 = top-1).
+F3A_RANK_COMPETITIVE     = 10
 #: F3-a alignment window half-width k = ⌊L/8⌋ (methodology line 379).
 F3A_ALIGNMENT_K_DIV        = 8
 #: Mid-rise window [L/4, 2L/3] (methodology line 371) and late window
@@ -433,10 +445,23 @@ class F3aTrajectoryResult:
     p_new_mid_peak: float
     p_new_final: float
     trajectory_delta: float
-    is_f3_trajectory: bool             # at default τ
+    is_f3_trajectory: bool             # at default τ (legacy mid-window)
     is_f3_trajectory_sweep: dict       # {τ: bool} across F3A_TAU_SWEEP
 
     late_drop: float                   # P^{l_peak}(new) − min_{l > l_peak} P^l(new)
+
+    # ── Data-driven window (measurable redesign) ──────────────────────────────
+    # Peak over ALL layers + peak-to-final drop.  This captures the late
+    # rise-then-drop the fixed mid-window misses on crystallization models.
+    peak_layer_all: int = -1           # data-driven L* (argmax over all layers)
+    p_new_peak_all: float = 0.0
+    suppression_drop: float = 0.0      # p_new_peak_all − p_new_final
+    is_suppression: bool = False       # suppression_drop > F3A_DROP_TAU
+    # Rank-based readout (calibration-free).  -1 = answer_new never competitive.
+    first_rank_competitive_layer: int = -1
+    rank_new_final: int = -1
+    # Behavioral anchor (filled from b1_outputs_param; the F3 classifier).
+    b1_outputs_param: Optional[bool] = None
 
     # Sublayer Δ stacks (last token) for ATTN + MLP, computed via raw lens.
     delta_attn_new: np.ndarray = field(repr=False)
@@ -464,6 +489,46 @@ def _late_drop(probs: np.ndarray, peak_layer: int) -> float:
         return 0.0
     tail = probs[peak_layer + 1:]
     return float(probs[peak_layer] - tail.min()) if tail.size else 0.0
+
+
+def peak_over_all_layers(probs: np.ndarray) -> tuple[float, int]:
+    """Data-driven peak: ``(max_l P^l, argmax_l)`` over **all** layers.
+
+    Replaces the fixed mid-window peak (methodology F3-a measurable redesign).
+    On late-crystallization models the rise occurs in late layers, so anchoring
+    the peak to a fixed mid-window misses it entirely.
+    """
+    if probs.size == 0:
+        return 0.0, 0
+    arg = int(np.argmax(probs))
+    return float(probs[arg]), arg
+
+
+def suppression_drop(probs: np.ndarray) -> tuple[float, int]:
+    """Return ``(peak − final, peak_layer)`` over all layers.
+
+    This is the F3 "routed then overridden" signal: answer_new reaches a peak
+    at some (data-driven) layer L*, then is suppressed by the final layer.
+    """
+    peak_val, peak_layer = peak_over_all_layers(probs)
+    drop = float(peak_val - probs[-1]) if probs.size else 0.0
+    return drop, peak_layer
+
+
+def first_rank_competitive_layer(
+    ranks: np.ndarray | None,
+    *,
+    rank_thr: int = F3A_RANK_COMPETITIVE,
+) -> int:
+    """First layer where ``answer_new`` enters the top-``rank_thr`` (-1 if never).
+
+    Calibration-free "routed" detector: if answer_new never becomes
+    rank-competitive at any layer it was not routed into the readout at all.
+    """
+    if ranks is None or len(ranks) == 0:
+        return -1
+    hits = np.nonzero(np.asarray(ranks) < rank_thr)[0]
+    return int(hits[0]) if hits.size else -1
 
 
 def run_f3a_trajectory(
@@ -517,6 +582,12 @@ def run_f3a_trajectory(
         }
         ld = _late_drop(p_new, peak_layer)
 
+        # Data-driven window: peak over ALL layers + peak-to-final drop.
+        drop_all, peak_layer_all = suppression_drop(p_new)
+        ranks_new = getattr(traj, "ranks_new", None)
+        first_rc = first_rank_competitive_layer(ranks_new)
+        rank_new_final = int(ranks_new[-1]) if ranks_new is not None else -1
+
         # Sublayer Δ — single extra forward pass (3-hook tap per layer).
         sub = compute_sublayer_probs(
             model, tokens, [inst.answer_new_tid, inst.a_param_tid], lens_kind=lens_kind,
@@ -555,6 +626,13 @@ def run_f3a_trajectory(
             delta_mlp_new=d_mlp_new,
             delta_attn_param=d_attn_param,
             delta_mlp_param=d_mlp_param,
+            peak_layer_all=peak_layer_all,
+            p_new_peak_all=float(p_new[peak_layer_all]),
+            suppression_drop=drop_all,
+            is_suppression=bool(drop_all > F3A_DROP_TAU),
+            first_rank_competitive_layer=first_rc,
+            rank_new_final=rank_new_final,
+            b1_outputs_param=inst.b1_outputs_param,
         ))
 
         bar.set_postfix(traj=is_f3, ok=len(results))
@@ -562,6 +640,298 @@ def run_f3a_trajectory(
             torch.cuda.empty_cache()
     bar.close()
     return results
+
+
+# ── Behavioral-anchor F1/F2/F3 classifier (measurable redesign) ─────────────
+
+
+def classify_failure_mode(
+    r: "F3aTrajectoryResult",
+    *,
+    rank_thr: int = F3A_RANK_COMPETITIVE,
+) -> str:
+    """Assign F1 / F2 / F3 / MIXED to a B1-failure instance (behavioral_primary).
+
+    Precedence (methodology F3 measurable redesign):
+
+    1. **F3 — "Time Routed but Overridden"**: anchored on the behavioral
+       ground truth ``b1_outputs_param`` (the model actually emitted
+       ``a_param``).  Behaviour wins over trajectory shape: an instance whose
+       trajectory peaks-then-drops but that did *not* emit ``a_param`` is
+       *not* F3 (it falls through to F2 / MIXED).  The trajectory
+       (``is_suppression`` / ``suppression_drop``) is the mechanistic
+       *explanation* of F3, never the classifier.
+    2. **F1 — "Time Not Set"**: ``answer_new`` never becomes rank-competitive
+       (top-``rank_thr``) at any layer — it never entered the readout.
+    3. **F2 — "Set but Not Routed"**: ``answer_new`` became rank-competitive
+       at some layer (the information formed) but never reached the output and
+       the model did not emit ``a_param``.
+    4. **MIXED / Unresolved**: anything that does not fit cleanly (e.g.
+       competitive *and* final-dominant yet still scored a failure).
+
+    ``b1_success`` instances return ``"SUCCESS"`` (not part of the failure
+    taxonomy).
+    """
+    if r.b1_success:
+        return "SUCCESS"
+    if r.b1_outputs_param:
+        return "F3"
+    routed = r.first_rank_competitive_layer >= 0
+    if not routed:
+        return "F1"
+    if r.rank_new_final != 0:
+        return "F2"
+    return "MIXED"
+
+
+@dataclass
+class FailureModeSummary:
+    """Population-level F1/F2/F3/MIXED distribution + F3 mechanism hit-rate."""
+    counts: dict             # {mode: n}
+    rates: dict              # {mode: fraction of failures}
+    n_failures: int
+    # Among the behavioral F3 cohort (b1_outputs_param), the fraction that
+    # ALSO show the late rise-then-drop suppression signature.  This is the
+    # numerator of the F3 mechanism claim (methodology F3-a).
+    f3_mechanism_hit_rate: Optional[float]
+    f3_cohort_n: int
+    counts_by_param_class: dict  # {param_class: {mode: n}}
+
+
+def summarize_failure_modes(
+    results: Sequence["F3aTrajectoryResult"],
+    *,
+    rank_thr: int = F3A_RANK_COMPETITIVE,
+) -> FailureModeSummary:
+    """Aggregate per-instance failure modes into the Part III distribution."""
+    counts: dict[str, int] = {}
+    by_class: dict[str, dict[str, int]] = {}
+    f3_total = 0
+    f3_with_mechanism = 0
+    n_failures = 0
+    for r in results:
+        mode = classify_failure_mode(r, rank_thr=rank_thr)
+        if mode == "SUCCESS":
+            continue
+        n_failures += 1
+        counts[mode] = counts.get(mode, 0) + 1
+        cls = by_class.setdefault(r.param_class, {})
+        cls[mode] = cls.get(mode, 0) + 1
+        if mode == "F3":
+            f3_total += 1
+            if r.is_suppression:
+                f3_with_mechanism += 1
+    rates = {k: (v / n_failures if n_failures else 0.0) for k, v in counts.items()}
+    hit_rate = (f3_with_mechanism / f3_total) if f3_total else None
+    return FailureModeSummary(
+        counts=counts,
+        rates=rates,
+        n_failures=n_failures,
+        f3_mechanism_hit_rate=hit_rate,
+        f3_cohort_n=f3_total,
+        counts_by_param_class=by_class,
+    )
+
+
+# ── F3 causal main line: late-window SPAN intervention ──────────────────────
+
+
+@dataclass
+class F3InterventionResult:
+    """One late-window span-intervention trial (methodology F3 causal leg)."""
+    instance_id: str
+    fact_id: str
+    param_class: str
+    variant: str
+    l_star: int
+    span_lo: int
+    span_hi: int
+    baseline_gen: str
+    intervened_gen: str
+    random_gen: str
+    recovered: bool          # intervened matches answer_new AND baseline did not
+    random_recovered: Optional[bool]  # control; None when no disjoint span exists
+
+
+@dataclass
+class F3InterventionSummary:
+    variant: str
+    n: int
+    n_control: int           # instances with a valid disjoint random control
+    recovery_rate: float
+    random_recovery_rate: float  # NaN when no instance had a disjoint control
+    delta: float             # recovery_rate − random_recovery_rate (NaN if no control)
+
+
+# Span-intervention variants (methodology F3 causal main line).  All operate on
+# the data-driven span (L*, final]: the layers between the answer_new peak and
+# the output, where the suppression occurs.
+#   peak_freeze    : zero attn_out AND mlp_out in the span -> residual frozen at
+#                    its L* state (clean reading of "freeze L* forward to final").
+#   mlp_disinhibit : zero mlp_out only (CoRect-style late-FFN disinhibition).
+#   attn_ko        : zero attn_out only (late-attention knockout).
+F3_INTERVENTION_VARIANTS = ("peak_freeze", "mlp_disinhibit", "attn_ko")
+
+
+def _zero_hook(act: torch.Tensor, hook) -> torch.Tensor:  # noqa: ARG001
+    return torch.zeros_like(act)
+
+
+def _span_hooks(variant: str, span: Sequence[int]) -> list[tuple[str, Callable]]:
+    hooks: list[tuple[str, Callable]] = []
+    for l in span:
+        if variant in ("peak_freeze", "attn_ko"):
+            hooks.append((f"blocks.{l}.hook_attn_out", _zero_hook))
+        if variant in ("peak_freeze", "mlp_disinhibit"):
+            hooks.append((f"blocks.{l}.hook_mlp_out", _zero_hook))
+    return hooks
+
+
+def _generate_with_hooks(
+    model: HookedTransformer,
+    prompt: str,
+    fwd_hooks: list[tuple[str, Callable]],
+    *,
+    max_new_tokens: int = 24,
+) -> str:
+    """Greedy decode under persistent forward hooks (mirrors model.generate_answer)."""
+    tok = model.tokenizer
+    enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
+    current_ids = enc["input_ids"].to(model.cfg.device)
+    eos_ids = set(_collect_eos_ids(tok))
+    generated: list[int] = []
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            if fwd_hooks:
+                logits = model.run_with_hooks(
+                    current_ids, fwd_hooks=fwd_hooks, prepend_bos=False,
+                )
+            else:
+                logits = model(current_ids, prepend_bos=False)
+            next_id = int(logits[0, -1, :].argmax())
+            del logits
+            if next_id in eos_ids:
+                break
+            generated.append(next_id)
+            current_ids = torch.cat(
+                [current_ids, torch.tensor([[next_id]], device=current_ids.device)],
+                dim=1,
+            )
+    raw = tok.decode(generated, skip_special_tokens=True)
+    return _clean_generated(raw)
+
+
+def run_f3_late_window_intervention(
+    model: HookedTransformer,
+    instances: Sequence[F3PreparedInstance],
+    *,
+    variants: Sequence[str] = F3_INTERVENTION_VARIANTS,
+    template: str = "phi3",
+    max_new_tokens: int = 24,
+    seed: int = 0,
+    verbose: bool = True,
+) -> tuple[list[F3InterventionResult], list[F3InterventionSummary]]:
+    """F3 causal main line: late-window SPAN intervention on the F3 cohort.
+
+    Cohort = behavioral F3 (``b1_outputs_param == True``).  For each instance:
+
+    1. Find the data-driven peak layer ``L*`` of ``P^l(answer_new)`` (the layer
+       where the routed answer is strongest before being suppressed).
+    2. Apply the span intervention over ``(L*, final]`` and greedily regenerate;
+       record whether the generation now matches ``answer_new`` (recovery).
+    3. Apply the **same-size span** at a random early/mid location as the
+       baseline control, regenerate, record recovery.
+
+    A causal F3 confirmation = recovery_rate >> random_recovery_rate.  SPAN
+    (not single-layer) intervention is used because suppression may be
+    distributed across late layers (MechLens, Gini < 0.015).
+    """
+    rng = _random.Random(seed)
+    cohort = [i for i in instances if i.b1_outputs_param]
+    n_layers = model.cfg.n_layers
+    results: list[F3InterventionResult] = []
+
+    bar = tqdm(cohort, desc="F3 late-window intervention",
+               disable=not verbose, unit="inst", dynamic_ncols=True)
+    for inst in bar:
+        row = inst.row
+        prompt = build_prompt(
+            str(row.get("context", "")), str(row.get("question", "")),
+            template=template,
+        )
+        tokens = model.to_tokens(prompt, prepend_bos=False)
+        traj = run_logit_lens(
+            model, tokens, inst.answer_new_tid, inst.a_param_tid, lens_kind="raw",
+        )
+        p_new = np.asarray(traj.probs_new, dtype=float)
+        _, l_star = peak_over_all_layers(p_new)
+        if l_star >= n_layers - 1:
+            continue  # no span to intervene on
+        span = list(range(l_star + 1, n_layers))
+        span_len = len(span)
+        # Disjoint random control of equal length in the early/mid region
+        # [0, l_star].  If there is no room for a span that does NOT overlap the
+        # treatment span, skip the control entirely (random_recovered=None)
+        # rather than reusing the treatment span — equating them would force
+        # delta=0 and contaminate the random baseline.
+        if l_star >= span_len:
+            rand_start = rng.randint(0, l_star - span_len + 1)
+            rand_span: list[int] | None = list(range(rand_start, rand_start + span_len))
+        else:
+            rand_span = None
+
+        baseline_gen = _generate_with_hooks(
+            model, prompt, [], max_new_tokens=max_new_tokens,
+        )
+        # A baseline that already emits answer_new is not a genuine F3 override
+        # and must not be counted as a "recovery".
+        baseline_is_new = check_match(baseline_gen, inst.answer_new)
+        for variant in variants:
+            interv_gen = _generate_with_hooks(
+                model, prompt, _span_hooks(variant, span),
+                max_new_tokens=max_new_tokens,
+            )
+            if rand_span is not None:
+                rand_gen = _generate_with_hooks(
+                    model, prompt, _span_hooks(variant, rand_span),
+                    max_new_tokens=max_new_tokens,
+                )
+                random_recovered: Optional[bool] = check_match(rand_gen, inst.answer_new)
+            else:
+                rand_gen = ""
+                random_recovered = None
+            results.append(F3InterventionResult(
+                instance_id=inst.instance_id,
+                fact_id=inst.fact_id,
+                param_class=inst.param_class,
+                variant=variant,
+                l_star=l_star,
+                span_lo=span[0],
+                span_hi=span[-1],
+                baseline_gen=baseline_gen,
+                intervened_gen=interv_gen,
+                random_gen=rand_gen,
+                recovered=(check_match(interv_gen, inst.answer_new) and not baseline_is_new),
+                random_recovered=random_recovered,
+            ))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    bar.close()
+
+    summaries: list[F3InterventionSummary] = []
+    for variant in variants:
+        rows = [r for r in results if r.variant == variant]
+        if not rows:
+            continue
+        rec = float(np.mean([r.recovered for r in rows]))
+        ctrl = [r.random_recovered for r in rows if r.random_recovered is not None]
+        rnd = float(np.mean(ctrl)) if ctrl else float("nan")
+        delta = (rec - rnd) if ctrl else float("nan")
+        summaries.append(F3InterventionSummary(
+            variant=variant, n=len(rows), n_control=len(ctrl),
+            recovery_rate=rec, random_recovery_rate=rnd, delta=delta,
+        ))
+    return results, summaries
 
 
 # ── F3-a population-level summary + positive-control verdict ────────────────
@@ -2775,13 +3145,17 @@ __all__ = [
     "LStarResult", "F3cInstance", "F3cResult",
     "F3cContentInstance", "F3cContentResult", "F3Verdict",
     "SublayerProbs",
+    "FailureModeSummary", "F3InterventionResult", "F3InterventionSummary",
     # Helpers
     "mid_window", "late_window", "alignment_k",
+    "peak_over_all_layers", "suppression_drop", "first_rank_competitive_layer",
+    "classify_failure_mode", "summarize_failure_modes",
     "compute_sublayer_probs",
     # IO
     "load_layer3_by_key", "prepare_f3_instances", "build_f3_pair_prompts",
     # Phase entries
     "run_f3a_trajectory", "summarize_f3a_population",
+    "run_f3_late_window_intervention",
     "run_f3_half_bridge",
     "run_f3b_ablation",
     "run_f3c_step1_l_star",

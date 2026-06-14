@@ -325,6 +325,13 @@ class RouteScoreResult:
     route_score_peak: float    # p_new_peak − p_new_at_final            (robust variant)
     f2_regime: str             # one of {not_f2, f2_strong, f2_weak, f3}
     trajectory: LogitTrajectory
+    # ── Rank-based readout (measurable redesign, PRIMARY) ─────────────────────
+    # Calibration-free "routed" detector: answer_new becomes rank-competitive
+    # (top-F2_RANK_COMPETITIVE) at some layer.  ``routed`` + low final rank with
+    # no a_param emission ⇒ F2 ("Set but Not Routed").  -1 = never competitive.
+    first_rank_competitive_layer: int = -1
+    rank_new_final: int = -1
+    routed: bool = False
 
 
 # Default regime thresholds — match methodology F3-a's τ = 0.10 default and
@@ -334,6 +341,10 @@ F2_DEFAULT_P_FINAL_HIGH    = 0.30   # final P^L above this → signal survived �
 F2_DEFAULT_RS_STRONG_THR   = 0.02   # peak-final delta ≥ this → mid-rise drop occurred
 F2_DEFAULT_RS_F3_THR       = 0.10   # peak ≥ this above final → strong mid-rise → f3
 F2_DEFAULT_PEAK_LOW_THR    = 0.05   # absolute peak P^l below this ⇒ "never rises"
+#: Rank below which answer_new counts as "routed" into the readout (0 = top-1).
+#: Measurable-redesign PRIMARY readout; the absolute thresholds above are the
+#: legacy/Optional-hardening path (methodology F2-b).
+F2_RANK_COMPETITIVE        = 10
 
 
 def classify_f2_regime(
@@ -508,6 +519,16 @@ def compute_route_scores(
             peak_low_thr=peak_low_thr,
         )
 
+        # Rank-based readout (measurable-redesign PRIMARY).
+        ranks_new = getattr(traj, "ranks_new", None)
+        if ranks_new is not None and len(ranks_new) > 0:
+            ranks_arr = np.asarray(ranks_new)
+            hits = np.nonzero(ranks_arr < F2_RANK_COMPETITIVE)[0]
+            first_rc = int(hits[0]) if hits.size else -1
+            rank_final = int(ranks_arr[-1])
+        else:
+            first_rc, rank_final = -1, -1
+
         results.append(RouteScoreResult(
             instance_id=iid,
             p_new_at_temporal=p_temporal,
@@ -518,6 +539,9 @@ def compute_route_scores(
             route_score_peak=rs_peak,
             f2_regime=regime,
             trajectory=traj,
+            first_rank_competitive_layer=first_rc,
+            rank_new_final=rank_final,
+            routed=(first_rc >= 0),
         ))
         bar.set_postfix(rs=f"{rs:+.3f}", regime=regime, n=len(results))
 

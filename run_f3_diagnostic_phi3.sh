@@ -289,8 +289,8 @@ PLOT_ARGS=(--f3-dir "${OUT_DIR}" --out "${OUT_DIR}/plots" --model-tag "${MODEL_T
 if [ "${RUN_M_PROTOCOL}" = "1" ] && [ -d "${OUT_DIR_M}" ]; then
     PLOT_ARGS+=(--f3-dir-m "${OUT_DIR_M}")
 fi
-python scripts/plot_f3_results.py "${PLOT_ARGS[@]}" 2>/dev/null || {
-        echo "[WARNING] plot_f3_results.py failed or missing --f3-dir-m support; skipping plots."
+python scripts/plot_f3_results.py "${PLOT_ARGS[@]}" || {
+        echo "[WARNING] plot_f3_results.py failed; skipping plots (results JSONs are still valid)."
     }
 
 # ═════════════════════════════════════════════════════════════════════════════

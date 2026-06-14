@@ -1,0 +1,8 @@
+=== Wikidata Layer-1 Progress ===
+Status           : complete
+Timelines written: 158
+Target total     : 2000
+
+Completed properties:
+  chairperson                         (P488)  raw= 157  selected=157
+  position held                       (P39)  raw=   1  selected=  1
