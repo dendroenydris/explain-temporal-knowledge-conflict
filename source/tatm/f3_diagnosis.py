@@ -3123,6 +3123,8 @@ def to_jsonable(obj: Any) -> Any:
 
     if isinstance(obj, np.ndarray):
         return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
     if isinstance(obj, (np.floating, np.integer)):
         return obj.item()
     if isinstance(obj, (set, tuple)):
