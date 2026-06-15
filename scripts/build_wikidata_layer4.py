@@ -125,14 +125,26 @@ def classify_behavior(
 ) -> dict:
     rouge_new = rouge_l_f1(answer_new, generated)
     rouge_param = rouge_l_f1(a_param, generated)
-    both_pass = rouge_new > threshold and rouge_param > threshold
-    ambiguous = both_pass and abs(rouge_new - rouge_param) < margin
-    success = (
-        rouge_new > threshold
-        and rouge_new > rouge_param + margin
-        and not ambiguous
-    )
-    outputs_param = rouge_param > threshold and rouge_param >= rouge_new
+    # ``success`` (did the model output the new, correct-for-year answer?) and
+    # ``outputs_param`` (did it revert to its parametric answer?) are ORTHOGONAL
+    # axes.  When a_param == answer_new (PARAM_NEW / KNOWS_NEW) the new-vs-param
+    # comparison is degenerate (rouge_new == rouge_param), so the old clause
+    # ``rouge_new > rouge_param + margin`` wrongly scored a *correct* answer as a
+    # failure.  Gate the new-vs-param disambiguation on a_param != answer_new.
+    param_eq_new = check_match(a_param, answer_new)
+    if param_eq_new:
+        success = rouge_new > threshold
+        outputs_param = False
+        ambiguous = False
+    else:
+        both_pass = rouge_new > threshold and rouge_param > threshold
+        ambiguous = both_pass and abs(rouge_new - rouge_param) < margin
+        success = (
+            rouge_new > threshold
+            and rouge_new > rouge_param + margin
+            and not ambiguous
+        )
+        outputs_param = rouge_param > threshold and rouge_param >= rouge_new
     return {
         "rougeL_answer_new": rouge_new,
         "rougeL_a_param": rouge_param,

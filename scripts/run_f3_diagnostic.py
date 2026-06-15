@@ -246,13 +246,23 @@ def classify_b1_behavior(
         generated = generate_answer(model, prompt)
         rouge_new = rouge_l_f1(str(row.get("answer_new", "")), generated)
         rouge_param = rouge_l_f1(inst.a_param, generated)
-        both_pass = rouge_new > rouge_threshold and rouge_param > rouge_threshold
-        ambiguous = both_pass and abs(rouge_new - rouge_param) < rouge_margin
-        is_new = (rouge_new > rouge_threshold
-                  and rouge_new > rouge_param + rouge_margin
-                  and not ambiguous)
-        outputs_param = (rouge_param > rouge_threshold
-                         and rouge_param >= rouge_new)
+        # ``b1_success`` (output = answer_new) and ``outputs_param`` (output =
+        # parametric answer) are ORTHOGONAL.  When a_param == answer_new
+        # (PARAM_NEW) the new-vs-param comparison is degenerate, so the old
+        # ``rouge_new > rouge_param + margin`` clause wrongly scored a *correct*
+        # answer as a failure.  Gate disambiguation on a_param != answer_new.
+        if inst.param_class == "PARAM_NEW":
+            is_new = rouge_new > rouge_threshold
+            outputs_param = False
+            ambiguous = False
+        else:
+            both_pass = rouge_new > rouge_threshold and rouge_param > rouge_threshold
+            ambiguous = both_pass and abs(rouge_new - rouge_param) < rouge_margin
+            is_new = (rouge_new > rouge_threshold
+                      and rouge_new > rouge_param + rouge_margin
+                      and not ambiguous)
+            outputs_param = (rouge_param > rouge_threshold
+                             and rouge_param >= rouge_new)
         inst.b1_success = None if ambiguous else is_new
         inst.b1_outputs_param = outputs_param
         inst.b1_ambiguous = ambiguous
