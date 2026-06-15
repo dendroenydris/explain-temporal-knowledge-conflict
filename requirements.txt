@@ -27,3 +27,9 @@ scipy>=1.11.0
 
 # Numerics — pin <2.0 to stay compatible with TransformerLens internals
 numpy>=1.24.0,<2.0.0
+
+# Data manipulation (used by EAP-IG attribution pipeline)
+pandas>=1.5.0
+
+# Plotting — optional; only needed for EAP graph visualisation (not headless runs)
+matplotlib>=3.7.0

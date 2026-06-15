@@ -2,8 +2,11 @@ import sys
 import functools 
 
 import numpy as np
-import matplotlib
-import matplotlib.cm
+try:  # matplotlib is only needed for graph drawing (to_graphviz colormaps);
+    import matplotlib  # the headless EAP-IG circuit pipeline never draws.
+    import matplotlib.cm
+except ImportError:
+    matplotlib = None
 
 
 
