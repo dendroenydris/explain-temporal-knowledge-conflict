@@ -1,5 +1,6 @@
 from typing import Callable, List, Union, Optional, Literal
 from functools import partial
+import gc
 
 import torch
 from torch.utils.data import DataLoader
@@ -104,13 +105,14 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
             
     return (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference
 
-def tokenize_plus(model: HookedTransformer, inputs: List[str]):
+def tokenize_plus(model: HookedTransformer, inputs: List[str], *, max_seq_len: Optional[int] = None):
     """
     Tokenizes the input strings using the provided model.
 
     Args:
         model (HookedTransformer): The model used for tokenization.
         inputs (List[str]): The list of input strings to be tokenized.
+        max_seq_len: optional cap on sequence length (keeps prefix tokens).
 
     Returns:
         tuple: A tuple containing the following elements:
@@ -122,6 +124,10 @@ def tokenize_plus(model: HookedTransformer, inputs: List[str]):
     tokens = model.to_tokens(inputs, prepend_bos=True, padding_side='right')
     attention_mask = get_attention_mask(model.tokenizer, tokens, True)
     input_lengths = attention_mask.sum(1)
+    if max_seq_len is not None and tokens.shape[1] > max_seq_len:
+        tokens = tokens[:, :max_seq_len]
+        attention_mask = attention_mask[:, :max_seq_len]
+        input_lengths = torch.clamp(input_lengths, max=max_seq_len)
     n_pos = attention_mask.size(1)
     return tokens, attention_mask, input_lengths, n_pos
 
@@ -151,7 +157,7 @@ def get_scores_eap(model: HookedTransformer, graph: Graph, dataloader:DataLoader
 
     return scores
 
-def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], steps=30, quiet=False):
+def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], steps=30, quiet=False, max_seq_len: Optional[int] = None):
     scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)    
     
     total_items = 0
@@ -160,8 +166,8 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
         batch_size = len(clean)
         total_items += batch_size
 
-        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
-        corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean, max_seq_len=max_seq_len)
+        corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted, max_seq_len=max_seq_len)
 
         (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores)
 
@@ -175,6 +181,8 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
                 clean_logits = model(clean_tokens, attention_mask=attention_mask)
 
             input_activations_clean = input_activations_corrupted - activation_difference[:, :, graph.forward_index(graph.nodes['input'])]
+
+        clean_logits = clean_logits.detach()
 
         def input_interpolation_hook(k: int):
             def hook_fn(activations, hook):
@@ -190,6 +198,14 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
                 logits = model(clean_tokens, attention_mask=attention_mask)
                 metric_value = metric(logits, clean_logits, input_lengths, label)
                 metric_value.backward()
+            model.zero_grad(set_to_none=True)
+            del logits, metric_value
+
+        del activation_difference, input_activations_corrupted, input_activations_clean, clean_logits
+        del clean_tokens, corrupted_tokens, attention_mask, input_lengths
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     scores /= total_items
     scores /= total_steps
@@ -380,7 +396,7 @@ def get_scores_eap_ig_case(model: HookedTransformer, graph: Graph, data: tuple, 
     return scores
 
 allowed_aggregations = {'sum', 'mean', 'l2'}        
-def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], aggregation='sum', method: Union[Literal['EAP', 'EAP-IG', 'EAP-IG-partial-activations', 'EAP-IG-activations', 'clean-corrupted']]='EAP-IG', ig_steps: Optional[int]=5, quiet=False):
+def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], aggregation='sum', method: Union[Literal['EAP', 'EAP-IG', 'EAP-IG-partial-activations', 'EAP-IG-activations', 'clean-corrupted']]='EAP-IG', ig_steps: Optional[int]=5, quiet=False, max_seq_len: Optional[int] = None):
     if aggregation not in allowed_aggregations:
         raise ValueError(f'aggregation must be in {allowed_aggregations}, but got {aggregation}')
         
@@ -390,7 +406,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
     if method == 'EAP':
         scores = get_scores_eap(model, graph, dataloader, metric, quiet=quiet)
     elif method == 'EAP-IG':
-        scores = get_scores_eap_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet)
+        scores = get_scores_eap_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet, max_seq_len=max_seq_len)
     elif method == 'EAP-IG-partial-activations':
         scores = get_scores_ig_partial_activations(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet)
     elif method == 'EAP-IG-activations':

@@ -126,7 +126,8 @@ def build_invariant_rows(model, cat_file: Path, obj_idx: int,
 
 # ──────────────────────────── circuit per dataset ───────────────────────────
 def run_one_circuit(model, rows: list[dict], tag: str, *, out_dir: Path,
-                    tmp_dir: Path, ig_steps: int, threshold: float) -> int:
+                    tmp_dir: Path, ig_steps: int, threshold: float,
+                    max_seq_len: int | None = None) -> int:
     """Attribute one dataset, threshold-simplify, dump surviving nodes + per-head
     scores. Returns the number of surviving nodes (0 ⇒ skipped)."""
     if len(rows) < 2:
@@ -141,7 +142,10 @@ def run_one_circuit(model, rows: list[dict], tag: str, *, out_dir: Path,
     g = Graph.from_model(model)
     attribute(model, g, dataloader,
               partial(logit_diff, loss=True, mean=True),
-              method="EAP-IG", ig_steps=ig_steps)
+              method="EAP-IG", ig_steps=ig_steps, max_seq_len=max_seq_len)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # threshold-simplified node set (notebook cell 10 logic): a node survives if
     # it is incident to an edge whose |score| clears the threshold.
@@ -266,6 +270,11 @@ def main() -> None:
     ap.add_argument("--ig-steps", type=int, default=100)
     ap.add_argument("--threshold", type=float, default=0.1)
     ap.add_argument("--max-pairs", type=int, default=20)
+    ap.add_argument("--max-seq-len", type=int, default=256,
+                    help="truncate tokenized prompts to this length (saves VRAM)")
+    ap.add_argument("--dtype", default="bfloat16",
+                    choices=["float32", "float16", "bfloat16"],
+                    help="model weight/activation dtype (bfloat16 recommended for 7B)")
     ap.add_argument("--top-k", type=int, default=8,
                     help="number of top temporal heads to report (>=5 recommended)")
     ap.add_argument("--threshold-ratio", type=float, default=0.9)
@@ -285,9 +294,15 @@ def main() -> None:
     tmp_dir = out_dir / "_tmp_csv"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[load] {args.model}")
+    print(f"[load] {args.model}  dtype={args.dtype}  max_seq_len={args.max_seq_len}")
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
     model = HookedTransformer.from_pretrained(
         args.model, device=args.device,
+        dtype=dtype_map[args.dtype],
         fold_ln=False, center_writing_weights=False, center_unembed=False)
     model.cfg.use_split_qkv_input = not args.no_split_qkv
     model.cfg.use_attn_result = True
@@ -313,7 +328,8 @@ def main() -> None:
             rows = build_temporal_rows(model, cf, year, args.obj_token_idx,
                                        args.max_pairs, rng)
             run_one_circuit(model, rows, tag, out_dir=out_dir, tmp_dir=tmp_dir,
-                            ig_steps=args.ig_steps, threshold=args.threshold)
+                            ig_steps=args.ig_steps, threshold=args.threshold,
+                            max_seq_len=args.max_seq_len)
 
     # invariant circuits (control) — tag must NOT contain a 4-digit year
     for cat in args.invariant_categories:
@@ -328,7 +344,8 @@ def main() -> None:
         rows = build_invariant_rows(model, cf, args.obj_token_idx,
                                     args.max_pairs, rng)
         run_one_circuit(model, rows, tag, out_dir=out_dir, tmp_dir=tmp_dir,
-                        ig_steps=args.ig_steps, threshold=args.threshold)
+                        ig_steps=args.ig_steps, threshold=args.threshold,
+                        max_seq_len=args.max_seq_len)
 
     # aggregate -> RANKED top-K temporal heads (graded, not a binary set)
     ranked = rank_temporal_heads(out_dir, args.top_k, args.threshold_ratio)

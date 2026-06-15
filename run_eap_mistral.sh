@@ -4,7 +4,7 @@
 #SBATCH --account=aisc
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --mem=64G
+#SBATCH --mem=160G
 #SBATCH --exclude=ga03
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/eap_mistral_%j.out
@@ -27,9 +27,11 @@ MODEL="${MODEL:-mistralai/Mistral-7B-Instruct-v0.1}"
 MODEL_NAME="${MODEL_NAME:-Mistral-7B-Instruct-v0.1}"
 OBJ_TOKEN_IDX="${OBJ_TOKEN_IDX:-0}"
 YEARS="${YEARS:-1999 2004 2009}"
-IG_STEPS="${IG_STEPS:-100}"
+IG_STEPS="${IG_STEPS:-50}"
 MAX_PAIRS="${MAX_PAIRS:-20}"
 TOP_K="${TOP_K:-8}"
+DTYPE="${DTYPE:-bfloat16}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-256}"
 NO_SPLIT_QKV="${NO_SPLIT_QKV:-0}"
 
 command -v conda >/dev/null || { echo "[ERROR] conda not found" >&2; exit 1; }
@@ -45,7 +47,7 @@ fi
 ARGS=()
 [ "${NO_SPLIT_QKV}" = "1" ] && ARGS+=(--no-split-qkv)
 
-echo "MODEL=${MODEL}  MODEL_NAME=${MODEL_NAME}  OBJ_TOKEN_IDX=${OBJ_TOKEN_IDX}  TOP_K=${TOP_K}  NO_SPLIT_QKV=${NO_SPLIT_QKV}"
+echo "MODEL=${MODEL}  MODEL_NAME=${MODEL_NAME}  OBJ_TOKEN_IDX=${OBJ_TOKEN_IDX}  TOP_K=${TOP_K}  DTYPE=${DTYPE}  MAX_SEQ_LEN=${MAX_SEQ_LEN}  IG_STEPS=${IG_STEPS}  NO_SPLIT_QKV=${NO_SPLIT_QKV}"
 python scripts/run_eap_circuit.py \
   --model "${MODEL}" \
   --model-name "${MODEL_NAME}" \
@@ -54,6 +56,8 @@ python scripts/run_eap_circuit.py \
   --ig-steps "${IG_STEPS}" \
   --max-pairs "${MAX_PAIRS}" \
   --top-k "${TOP_K}" \
+  --dtype "${DTYPE}" \
+  --max-seq-len "${MAX_SEQ_LEN}" \
   --skip-existing \
   "${ARGS[@]}" \
   "$@"
