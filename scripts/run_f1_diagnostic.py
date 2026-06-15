@@ -65,6 +65,13 @@ from tatm.sat_probe import (
 )
 
 
+# Clean p(answer_old) floor above which answer_old counts as a genuine
+# competitor.  Used to restrict the F1-c logit-difference readout to instances
+# where the new-vs-old axis is meaningful (otherwise the year only redistributes
+# probability mass onto answer_new, which the logit-diff axis cannot capture).
+F1C_COMPETITOR_TAU = 0.01
+
+
 # ── Data loading ─────────────────────────────────────────────────────────────
 
 def _is_layer2(record: dict) -> bool:
@@ -719,10 +726,16 @@ def _f1c_run_one(
     ko_layers: list[int],
     n_random_samples: int,
     instance_seed: int,
+    norenorm_ablation: bool = False,
 ) -> Optional[dict]:
     """Single-instance year-token knockout + matched random-token control.
 
     Returns ``None`` if the year/placeholder cannot be located in the prompt.
+
+    When ``norenorm_ablation`` is True an extra year-knockout pass is run with
+    ``renormalize=False`` to quantify how much of the p(answer_new) movement is
+    driven by attention-mass redistribution (the confound) rather than removal
+    of the year signal itself.
     """
     context    = _get_prompt_context(inst)
     question   = inst.get("question", "")
@@ -774,6 +787,42 @@ def _f1c_run_one(
         entry["p_old_knockout"] = p_ko
         entry["p_old_gain"]    = p_ko - p_clean
 
+    # ── Logit-difference metric (PRIMARY, Zhang & Nanda 2024) ────────────────
+    # ld_drop = (logit_new - logit_old)_clean - (logit_new - logit_old)_ko.
+    # Positive => year knockout reduced answer_new's advantage over answer_old,
+    # i.e. the year was causally used (the F1-correct direction).  Unlike the
+    # p(answer_new)-only readout this is not fooled by the knockout-renormalise
+    # confound (mass redistributed onto the in-context answer lifts new and old
+    # together, so the difference is robust).
+    entry["old_is_competitor"] = bool(entry.get("p_old_clean", 0.0) >= F1C_COMPETITOR_TAU)
+    if new_tid >= 0 and old_tid >= 0:
+        lc, lk = ko["logits_clean"], ko["logits_ko"]
+        ld_clean = float(lc[new_tid] - lc[old_tid])
+        ld_ko    = float(lk[new_tid] - lk[old_tid])
+        entry["logit_diff_clean"]    = ld_clean
+        entry["logit_diff_knockout"] = ld_ko
+        entry["ld_drop"]             = ld_clean - ld_ko
+
+    # ── Optional: no-renormalisation ablation ───────────────────────────────
+    if norenorm_ablation:
+        ko_nr = attention_knockout(
+            model, tokens, year_pos,
+            knockout_layers=ko_layers,
+            answer_token_ids=track_tids if track_tids else None,
+            renormalize=False,
+        )
+        abl: dict = {}
+        if new_tid >= 0 and new_tid in ko_nr["probs_clean"]:
+            p_c = ko_nr["probs_clean"][new_tid]
+            p_k = ko_nr["probs_ko"][new_tid]
+            abl["p_new_clean"] = p_c
+            abl["p_new_knockout"] = p_k
+            abl["p_new_drop_relative"] = (p_c - p_k) / max(p_c, 1e-12)
+        if new_tid >= 0 and old_tid >= 0:
+            lc, lk = ko_nr["logits_clean"], ko_nr["logits_ko"]
+            abl["ld_drop"] = float((lc[new_tid] - lc[old_tid]) - (lk[new_tid] - lk[old_tid]))
+        entry["norenorm"] = abl
+
     # ── Random-token control ────────────────────────────────────────────────
     exclude = set(year_pos) | {seq_len - 1}
     rand_position_sets = _sample_random_positions(
@@ -783,6 +832,7 @@ def _f1c_run_one(
     )
 
     rand_drops: list[float] = []
+    rand_ld_drops: list[float] = []
     rand_details: list[dict] = []
     for sample_i, rand_pos in enumerate(rand_position_sets):
         if not rand_pos:
@@ -792,33 +842,68 @@ def _f1c_run_one(
             knockout_layers=ko_layers,
             answer_token_ids=track_tids if track_tids else None,
         )
+        detail: dict = {"sample": sample_i, "rand_positions": rand_pos}
         if new_tid >= 0 and new_tid in ko_rand["probs_clean"]:
             p_c  = ko_rand["probs_clean"][new_tid]
             p_kr = ko_rand["probs_ko"][new_tid]
             rel_drop = (p_c - p_kr) / max(p_c, 1e-12)
             rand_drops.append(rel_drop)
-            rand_details.append({
-                "sample": sample_i,
-                "rand_positions": rand_pos,
-                "p_new_drop_relative": rel_drop,
-            })
+            detail["p_new_drop_relative"] = rel_drop
+        if new_tid >= 0 and old_tid >= 0:
+            lc, lk = ko_rand["logits_clean"], ko_rand["logits_ko"]
+            ld_drop_r = float((lc[new_tid] - lc[old_tid]) - (lk[new_tid] - lk[old_tid]))
+            rand_ld_drops.append(ld_drop_r)
+            detail["ld_drop"] = ld_drop_r
+        if len(detail) > 2:
+            rand_details.append(detail)
 
-    if rand_drops:
-        entry["rand_control"] = {
-            "n_samples": len(rand_drops),
-            "mean_drop_relative": float(np.mean(rand_drops)),
-            "max_drop_relative": float(np.max(rand_drops)),
+    if rand_drops or rand_ld_drops:
+        rc: dict = {
+            "n_samples": max(len(rand_drops), len(rand_ld_drops)),
             "details": rand_details,
         }
-        # Specificity ratio: year drop / mean random drop.
-        year_drop = entry.get("p_new_drop_relative", 0.0)
-        mean_rand = entry["rand_control"]["mean_drop_relative"]
-        entry["specificity_ratio"] = year_drop / max(abs(mean_rand), 1e-6)
+        if rand_drops:
+            rc["mean_drop_relative"] = float(np.mean(rand_drops))
+            rc["max_drop_relative"]  = float(np.max(rand_drops))
+        if rand_ld_drops:
+            rc["mean_ld_drop"] = float(np.mean(rand_ld_drops))
+        entry["rand_control"] = rc
+
+        # Specificity ratios: year effect / mean random effect.
+        if "mean_drop_relative" in rc:
+            entry["specificity_ratio"] = (
+                entry.get("p_new_drop_relative", 0.0) / max(abs(rc["mean_drop_relative"]), 1e-6)
+            )
+        if "mean_ld_drop" in rc and "ld_drop" in entry:
+            entry["specificity_ratio_ld"] = (
+                entry["ld_drop"] / max(abs(rc["mean_ld_drop"]), 1e-6)
+            )
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     return entry
+
+
+def _f1c_bucket(r: dict) -> str:
+    """Explain why the p(answer_new)-only metric can mislead for this instance.
+
+    - ceiling_old_absent : answer_old not a competitor (p_old_clean < tau) — the
+      logit-diff axis is undefined; year can only redistribute mass onto new.
+    - disambiguation_old_rose : knockout raised p_old (year was disambiguating).
+    - renorm_new_rose : knockout raised p_new (renormalise-to-context confound).
+    """
+    p_old_c = float(r.get("p_old_clean", 0.0))
+    p_old_k = float(r.get("p_old_knockout", 0.0))
+    p_new_c = float(r.get("p_new_clean", 0.0))
+    p_new_k = float(r.get("p_new_knockout", 0.0))
+    if p_old_c < F1C_COMPETITOR_TAU:
+        return "ceiling_old_absent"
+    if (p_old_k - p_old_c) >= 0.05:
+        return "disambiguation_old_rose"
+    if (p_new_k - p_new_c) >= 0.05:
+        return "renorm_new_rose"
+    return "other"
 
 
 def _summarize_drops(label: str, results: list[dict]) -> dict:
@@ -829,13 +914,13 @@ def _summarize_drops(label: str, results: list[dict]) -> dict:
     median_drop = float(np.median(drops))
     pct_10      = sum(1 for d in drops if d > 0.10) / len(drops)
     print(f"\n  [{label}]  n={len(drops)}")
-    print(f"    Mean   p(answer_new) drop: {mean_drop:+.4f}")
-    print(f"    Median p(answer_new) drop: {median_drop:+.4f}")
-    print(f"    Fraction >10% drop:        {pct_10:.2%}")
+    print(f"    (reference) Mean   p(answer_new) drop: {mean_drop:+.4f}")
+    print(f"    (reference) Median p(answer_new) drop: {median_drop:+.4f}")
+    print(f"    (reference) Fraction >10% drop:        {pct_10:.2%}")
 
     rand_mean_drops = [
         r["rand_control"]["mean_drop_relative"]
-        for r in results if "rand_control" in r
+        for r in results if "rand_control" in r and "mean_drop_relative" in r["rand_control"]
     ]
     rand_mean = rand_p10 = mean_spec = None
     if rand_mean_drops:
@@ -843,16 +928,64 @@ def _summarize_drops(label: str, results: list[dict]) -> dict:
         rand_p10  = sum(1 for d in rand_mean_drops if d > 0.10) / len(rand_mean_drops)
         spec_ratios = [r["specificity_ratio"] for r in results if "specificity_ratio" in r]
         mean_spec = float(np.mean(spec_ratios)) if spec_ratios else float("nan")
-        print(f"    [control] Mean random-token drop:   {rand_mean:+.4f}")
-        print(f"    [control] Fraction random >10% drop:{rand_p10:.2%}")
-        print(f"    Specificity ratio (year/random):    {mean_spec:.2f}x")
-        if mean_spec is not None and mean_spec > 2.0:
-            print(f"    → year-token knockout is SPECIFIC (ratio > 2)")
-        elif mean_spec is not None and mean_spec > 1.0:
-            print(f"    → year-token knockout is moderately specific (ratio > 1)")
-        else:
-            print(f"    → year-token effect not clearly specific vs random")
+
+    # ── PRIMARY: logit-difference (log p_new - log p_old) ────────────────────
+    # ld_drop > 0  =>  year knockout reduced answer_new's advantage = year matters.
+    ld_all  = [r["ld_drop"] for r in results if "ld_drop" in r]
+    ld_comp = [r["ld_drop"] for r in results
+               if "ld_drop" in r and r.get("old_is_competitor")]
+    buckets: dict[str, int] = {}
+    for r in results:
+        buckets[_f1c_bucket(r)] = buckets.get(_f1c_bucket(r), 0) + 1
+
+    ld_mean = ld_median = ld_pos = None
+    ldc_mean = ldc_median = ldc_pos = None
+    ld_spec = None
+    if ld_all:
+        ld_mean   = float(np.mean(ld_all))
+        ld_median = float(np.median(ld_all))
+        ld_pos    = float(np.mean([1.0 if v > 0 else 0.0 for v in ld_all]))
+        print(f"    [PRIMARY] logit-diff drop  mean={ld_mean:+.4f} "
+              f"median={ld_median:+.4f} frac>0={ld_pos:.2%} (n={len(ld_all)})")
+    if ld_comp:
+        ldc_mean   = float(np.mean(ld_comp))
+        ldc_median = float(np.median(ld_comp))
+        ldc_pos    = float(np.mean([1.0 if v > 0 else 0.0 for v in ld_comp]))
+        print(f"    [PRIMARY] logit-diff (competitor-restricted) mean={ldc_mean:+.4f} "
+              f"median={ldc_median:+.4f} frac>0={ldc_pos:.2%} (n={len(ld_comp)})")
+        ld_specs = [r["specificity_ratio_ld"] for r in results
+                    if "specificity_ratio_ld" in r and r.get("old_is_competitor")]
+        ld_spec = float(np.mean(ld_specs)) if ld_specs else None
+        if ld_spec is not None:
+            print(f"    [PRIMARY] logit-diff specificity (year/random): {ld_spec:.2f}x")
+    print(f"    buckets: {buckets}")
+
     return {
+        "p_new_metric": {
+            "mean_drop": mean_drop,
+            "median_drop": median_drop,
+            "pct_above_10": pct_10,
+            "rand_mean_drop": rand_mean,
+            "rand_pct_above_10": rand_p10,
+            "mean_specificity_ratio": mean_spec,
+            "note": "reference only; p(answer_new)-only readout, see methodology F1-c",
+        },
+        "logit_diff_metric": {
+            "mean_ld_drop": ld_mean,
+            "median_ld_drop": ld_median,
+            "frac_positive": ld_pos,
+            "n": len(ld_all),
+            "competitor_restricted": {
+                "mean_ld_drop": ldc_mean,
+                "median_ld_drop": ldc_median,
+                "frac_positive": ldc_pos,
+                "n": len(ld_comp),
+                "mean_specificity_ratio": ld_spec,
+            },
+            "buckets": buckets,
+            "note": "PRIMARY; ld_drop>0 => year knockout weakens new-over-old advantage",
+        },
+        # Back-compat top-level keys (old consumers).
         "mean_drop": mean_drop,
         "median_drop": median_drop,
         "pct_above_10": pct_10,
@@ -862,7 +995,8 @@ def _summarize_drops(label: str, results: list[dict]) -> dict:
     }
 
 
-def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
+def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir,
+            norenorm_ablation: bool = False):
     """Methodology F1-c — Attention Knockout with random-token control.
 
     Per methodology (lines 248–271): block attention from the prediction
@@ -913,6 +1047,7 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
                 ko_layers=ko_layers_full,
                 n_random_samples=N_RANDOM_SAMPLES,
                 instance_seed=idx,
+                norenorm_ablation=norenorm_ablation,
             )
             if entry is None:
                 bar.set_postfix_str("skip (no year toks)", refresh=True)
@@ -1102,6 +1237,14 @@ def main():
         "--temporal-heads-top-k", type=int, default=10,
         help="How many heads to take from the temporal-heads JSON (default: 10 = all listed).",
     )
+    parser.add_argument(
+        "--f1c-norenorm-ablation", action="store_true",
+        help=(
+            "F1-c: run an extra year-knockout pass with attention NOT renormalised, "
+            "to quantify how much p(answer_new) movement is the redistribution "
+            "confound vs. removal of the year signal. [OPTIONAL · confirmatory]"
+        ),
+    )
     args = parser.parse_args()
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
@@ -1214,7 +1357,8 @@ def main():
     if "f1c" not in args.skip:
         if y is None:
             X, y, meta = collect_features(model, b1_instances, template=args.template)
-        run_f1c(model, b1_instances, y, top_heads_list, args.template, out_dir)
+        run_f1c(model, b1_instances, y, top_heads_list, args.template, out_dir,
+                norenorm_ablation=args.f1c_norenorm_ablation)
 
     print("\n" + "=" * 60)
     print("F1 Diagnostic complete. Results saved to:", out_dir)

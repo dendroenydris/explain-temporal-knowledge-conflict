@@ -214,9 +214,48 @@ def plot_f1b(data: dict, out_dir: Path):
 
 
 # ── Figure 3 – F1-c: Knockout effect distributions ──────────────────────────
+_LD_EPS = 1e-12
+_COMPETITOR_TAU = 0.01
+
+
 def _f1c_drops(records: list[dict]) -> list[float]:
+    """Legacy p(answer_new)-only relative drop (reference only)."""
     return [r["p_new_drop_relative"] for r in (records or [])
             if "p_new_drop_relative" in r]
+
+
+def _ld_drop(r: dict) -> Optional[float]:
+    """PRIMARY metric: logit-diff drop = (log p_new - log p_old)_clean - (..)_ko.
+
+    Uses the stored ``ld_drop`` when present (new runs); otherwise recomputes it
+    from the stored probabilities so existing result JSONs still plot.
+    """
+    if isinstance(r.get("ld_drop"), (int, float)):
+        return float(r["ld_drop"])
+    keys = ("p_new_clean", "p_old_clean", "p_new_knockout", "p_old_knockout")
+    if not all(k in r for k in keys):
+        return None
+    lg = lambda p: float(np.log(max(float(p), _LD_EPS)))
+    ld_clean = lg(r["p_new_clean"]) - lg(r["p_old_clean"])
+    ld_ko    = lg(r["p_new_knockout"]) - lg(r["p_old_knockout"])
+    return ld_clean - ld_ko
+
+
+def _is_competitor(r: dict) -> bool:
+    if "old_is_competitor" in r:
+        return bool(r["old_is_competitor"])
+    return float(r.get("p_old_clean", 0.0)) >= _COMPETITOR_TAU
+
+
+def _f1c_ld_drops(records: list[dict], competitor_only: bool = True) -> list[float]:
+    out: list[float] = []
+    for r in (records or []):
+        if competitor_only and not _is_competitor(r):
+            continue
+        v = _ld_drop(r)
+        if v is not None:
+            out.append(v)
+    return out
 
 
 def _f1c_get_populations(data: dict) -> dict[str, dict]:
@@ -242,22 +281,23 @@ def plot_f1c(data: dict, out_dir: Path):
     pops = _f1c_get_populations(data)
     succ = pops.get("b1_success", {})
     fail = pops.get("b1_failure", {})
-    succ_full = _f1c_drops(succ.get("per_instance_full"))
-    succ_deep = _f1c_drops(succ.get("per_instance_deep"))
-    fail_full = _f1c_drops(fail.get("per_instance_full"))
-    fail_deep = _f1c_drops(fail.get("per_instance_deep"))
+
+    # PRIMARY metric: logit-diff drop on the competitor cohort.
+    succ_ld = _f1c_ld_drops(succ.get("per_instance_full"), competitor_only=True)
+    fail_ld = _f1c_ld_drops(fail.get("per_instance_full"), competitor_only=True)
+    # Reference: legacy p(answer_new)-only drop (all instances).
+    succ_pn = _f1c_drops(succ.get("per_instance_full"))
+    fail_pn = _f1c_drops(fail.get("per_instance_full"))
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), sharey=False)
     rng = np.random.default_rng(0)
     jitter = 0.08
 
-    # ── 3a: strip / scatter — success vs failure × full vs deep ─────────────
+    # ── 3a: PRIMARY — logit-diff drop strip plot (competitor cohort) ─────────
     ax = axes[0]
     column_specs = [
-        (1, "B1-succ\nfull",  succ_full, C_SUCCESS),
-        (2, "B1-succ\ndeep",  succ_deep, C_SUCCESS),
-        (3, "B1-fail\nfull",  fail_full, C_FAILURE),
-        (4, "B1-fail\ndeep",  fail_deep, C_FAILURE),
+        (1, f"B1-succ\ncompetitor",  succ_ld, C_SUCCESS),
+        (2, f"B1-fail\ncompetitor",  fail_ld, C_FAILURE),
     ]
     for x, _, drops, color in column_specs:
         if not drops:
@@ -269,23 +309,24 @@ def plot_f1c(data: dict, out_dir: Path):
         ax.plot(x, mn, marker="D", color=color, markersize=8, zorder=5,
                 markeredgecolor="white")
 
-    ax.axhline(0,    color="black", linewidth=0.8, linestyle="--")
-    ax.axhline(0.10, color="grey",  linewidth=0.6, linestyle=":", alpha=0.7,
-               label=">10% threshold")
+    ax.axhline(0, color="black", linewidth=0.9, linestyle="--",
+               label="0 (year had no effect)")
     ax.set_xticks([s[0] for s in column_specs])
-    ax.set_xticklabels([s[1] for s in column_specs])
-    ax.set_ylabel("Relative p(answer_new) drop")
-    ax.set_title("F1-c  Year-Token Knockout × Population\n"
-                 "Line = median, Diamond = mean")
+    ax.set_xticklabels([f"{s[1]}\n(n={len(s[2])})" for s in column_specs])
+    ax.set_ylabel(r"logit-diff drop  $\Delta(\log p_{new}-\log p_{old})$")
+    ax.set_title("F1-c  PRIMARY — Year-Token Knockout (logit-diff)\n"
+                 "competitor cohort; >0 ⇒ year favored answer_new")
     ax.legend(fontsize=9, loc="upper right")
 
-    # ── 3b: CDF — full knockout, success vs failure ──────────────────────────
+    # ── 3b: CDF of logit-diff drop + reference p_new CDF ────────────────────
     ax = axes[1]
     for drops, label, color in [
-        (succ_full, f"B1-success  full  (n={len(succ_full)}, mean={np.mean(succ_full):.3f})"
-                    if succ_full else "B1-success  full  (n=0)", C_SUCCESS),
-        (fail_full, f"B1-failure  full  (n={len(fail_full)}, mean={np.mean(fail_full):.3f})"
-                    if fail_full else "B1-failure  full  (n=0)", C_FAILURE),
+        (succ_ld, f"B1-success  (n={len(succ_ld)}, "
+                  f"med={np.median(succ_ld):+.2f})" if succ_ld else "B1-success (n=0)",
+         C_SUCCESS),
+        (fail_ld, f"B1-failure  (n={len(fail_ld)}, "
+                  f"med={np.median(fail_ld):+.2f})" if fail_ld else "B1-failure (n=0)",
+         C_FAILURE),
     ]:
         if not drops:
             continue
@@ -293,28 +334,31 @@ def plot_f1c(data: dict, out_dir: Path):
         cdf = np.arange(1, len(sorted_d) + 1) / len(sorted_d)
         ax.step(sorted_d, cdf, where="post", color=color, linewidth=2.0, label=label)
 
-    ax.axvline(0.10, color="grey",  linewidth=0.8, linestyle=":", label=">10% threshold")
-    ax.axvline(0.0,  color="black", linewidth=0.6, linestyle="--")
-    ax.set_xlabel("Relative p(answer_new) drop")
+    ax.axvline(0.0, color="black", linewidth=0.8, linestyle="--")
+    ax.set_xlabel(r"logit-diff drop  $\Delta(\log p_{new}-\log p_{old})$")
     ax.set_ylabel("CDF")
-    ax.set_title("F1-c  Full-Network Knockout CDF\nB1-success vs B1-failure")
+    ax.set_title("F1-c  Logit-Diff Knockout CDF\n(competitor cohort)")
     ax.legend(fontsize=9)
 
-    # ── specificity ratios in the suptitle ──────────────────────────────────
-    def _spec(pop: dict) -> Optional[float]:
+    # ── logit-diff specificity in the suptitle ───────────────────────────────
+    def _spec_ld(pop: dict) -> Optional[float]:
         full = pop.get("full_stats") or {}
-        v = full.get("mean_specificity_ratio")
+        ld = full.get("logit_diff_metric") or {}
+        cr = ld.get("competitor_restricted") or {}
+        v = cr.get("mean_specificity_ratio")
         return float(v) if isinstance(v, (int, float)) else None
-    spec_s = _spec(succ)
-    spec_f = _spec(fail)
-    spec_str = []
-    if spec_s is not None: spec_str.append(f"succ year/random = {spec_s:.2f}x")
-    if spec_f is not None: spec_str.append(f"fail year/random = {spec_f:.2f}x")
-    sub = "   |   ".join(spec_str) if spec_str else ""
+    spec_f = _spec_ld(fail)
+    sub_bits = []
+    if fail_ld:
+        sub_bits.append(f"fail competitor median = {np.median(fail_ld):+.2f}")
+    if spec_f is not None:
+        sub_bits.append(f"fail logit-diff specificity = {spec_f:.2f}x")
+    sub_bits.append("(p_new-only metric shown in reference panels only — see methodology F1-c)")
+    sub = "   |   ".join(sub_bits)
 
     fig.suptitle(
-        f"F1-c  Attention Knockout — Year vs Random-Token Control\n{sub}",
-        fontsize=13
+        f"F1-c  Attention Knockout (corroborating) — logit-diff = log p_new − log p_old\n{sub}",
+        fontsize=12
     )
     fig.tight_layout()
     fig.savefig(out_dir / "f1c_knockout_distribution.pdf", bbox_inches="tight")
@@ -326,8 +370,10 @@ def plot_f1c(data: dict, out_dir: Path):
 # ── Figure 4 – F1 Summary dashboard ─────────────────────────────────────────
 def plot_summary(f1a, f1b, f1c, out_dir: Path):
     pops = _f1c_get_populations(f1c)
-    succ_full = _f1c_drops(pops.get("b1_success", {}).get("per_instance_full"))
-    fail_full = _f1c_drops(pops.get("b1_failure", {}).get("per_instance_full"))
+    succ_full = _f1c_ld_drops(pops.get("b1_success", {}).get("per_instance_full"),
+                              competitor_only=True)
+    fail_full = _f1c_ld_drops(pops.get("b1_failure", {}).get("per_instance_full"),
+                              competitor_only=True)
 
     fig = plt.figure(figsize=(15, 5))
     gs  = fig.add_gridspec(1, 3, wspace=0.35)
@@ -380,28 +426,30 @@ def plot_summary(f1a, f1b, f1c, out_dir: Path):
     ax3 = fig.add_subplot(gs[2])
     plotted = False
     for drops, label, color in [
-        (succ_full, "B1-success  full", C_SUCCESS),
-        (fail_full, "B1-failure  full", C_FAILURE),
+        (succ_full, "B1-success", C_SUCCESS),
+        (fail_full, "B1-failure", C_FAILURE),
     ]:
         if not drops:
             continue
         sorted_d = np.sort(drops)
         cdf = np.arange(1, len(sorted_d) + 1) / len(sorted_d)
         ax3.step(sorted_d, cdf, where="post", color=color, linewidth=2.0,
-                 label=f"{label}  (n={len(drops)}, mean={np.mean(drops):.3f})")
+                 label=f"{label}  (n={len(drops)}, med={np.median(drops):+.2f})")
         plotted = True
-    ax3.axvline(0.10, color="grey", linewidth=0.8, linestyle=":", label=">10% threshold")
-    ax3.axvline(0.0,  color="black", linewidth=0.6, linestyle="--")
-    ax3.set_xlabel("Relative p(answer_new) drop")
+    ax3.axvline(0.0,  color="black", linewidth=0.8, linestyle="--")
+    ax3.set_xlabel(r"logit-diff drop  $\Delta(\log p_{new}-\log p_{old})$")
     ax3.set_ylabel("CDF")
-    ax3.set_title("F1-c  Full-Network Knockout\nB1-success vs B1-failure")
+    ax3.set_title("F1-c (corroborating)\nlogit-diff, competitor cohort")
     if plotted:
         ax3.legend(fontsize=9)
 
+    # H_T provenance: read is_fallback (validated H_T vs probe top-|coef| fallback).
+    is_fb = (f1a.get("step5_f1_positive") or {}).get("is_fallback")
+    ht_str = "H_T = top-3 |coef| fallback" if is_fb else "H_T = validated set"
     fig.suptitle(
         f"F1 Diagnostic Summary — methodology-aligned "
         f"(C={f1a.get('probe_C', 0.05)}, agg={f1a.get('feature_aggregation', 'mean')}, "
-        f"H_T = top-3 fallback)",
+        f"{ht_str})",
         fontsize=12, y=1.01
     )
     fig.savefig(out_dir / "f1_summary.pdf", bbox_inches="tight")

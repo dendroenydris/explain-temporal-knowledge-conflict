@@ -101,13 +101,21 @@ def _knockout_hook(
     *,
     src_positions: list[int],
     dest_idx: int,
+    renormalize: bool = True,
 ) -> torch.Tensor:
-    """Post-softmax hook: zero out attention from dest to src positions,
-    then renormalize the remaining weights so they sum to 1."""
+    """Post-softmax hook: zero out attention from dest to src positions.
+
+    When ``renormalize`` is True (default) the remaining weights are rescaled to
+    sum to 1 — standard attention-knockout practice.  Set it to False for the
+    no-renormalisation ablation: this measures the knockout effect *without*
+    redistributing the freed mass onto the (in-context) answer tokens, which is
+    the confound that can mechanically inflate p(answer_new) on B5.
+    """
     modified = attn_pattern.clone()
     modified[:, :, dest_idx, src_positions] = 0.0
-    row_sum = modified[:, :, dest_idx, :].sum(dim=-1, keepdim=True).clamp(min=1e-12)
-    modified[:, :, dest_idx, :] /= row_sum
+    if renormalize:
+        row_sum = modified[:, :, dest_idx, :].sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        modified[:, :, dest_idx, :] /= row_sum
     return modified
 
 
@@ -118,6 +126,7 @@ def attention_knockout(
     knockout_layers: Optional[list[int]] = None,
     *,
     answer_token_ids: Optional[list[int]] = None,
+    renormalize: bool = True,
 ) -> dict:
     """Run a forward pass with attention to *src_positions* knocked out.
 
@@ -153,7 +162,8 @@ def attention_knockout(
     hooks = [
         (
             f"blocks.{layer}.attn.hook_pattern",
-            partial(_knockout_hook, src_positions=src_positions, dest_idx=dest_idx),
+            partial(_knockout_hook, src_positions=src_positions, dest_idx=dest_idx,
+                    renormalize=renormalize),
         )
         for layer in knockout_layers
     ]
