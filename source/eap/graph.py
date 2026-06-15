@@ -345,10 +345,22 @@ class Graph:
         graph = Graph()
         if isinstance(model_or_config, HookedTransformer):
             cfg = model_or_config.cfg
-            graph.cfg = {'n_layers': cfg.n_layers, 'n_heads': cfg.n_heads, 'parallel_attn_mlp':cfg.parallel_attn_mlp}
+            n_kv = getattr(cfg, 'n_key_value_heads', cfg.n_heads)
+            graph.cfg = {
+                'n_layers': cfg.n_layers,
+                'n_heads': cfg.n_heads,
+                'n_key_value_heads': n_kv,
+                'parallel_attn_mlp': cfg.parallel_attn_mlp,
+            }
         elif isinstance(model_or_config, HookedTransformerConfig):
             cfg = model_or_config
-            graph.cfg = {'n_layers': cfg.n_layers, 'n_heads': cfg.n_heads, 'parallel_attn_mlp':cfg.parallel_attn_mlp}
+            n_kv = getattr(cfg, 'n_key_value_heads', cfg.n_heads)
+            graph.cfg = {
+                'n_layers': cfg.n_layers,
+                'n_heads': cfg.n_heads,
+                'n_key_value_heads': n_kv,
+                'parallel_attn_mlp': cfg.parallel_attn_mlp,
+            }
         else:
             graph.cfg = model_or_config
         

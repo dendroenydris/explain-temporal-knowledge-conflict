@@ -64,6 +64,17 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
                 grads = grads.unsqueeze(2)
             s = einsum(activation_difference[:, :, :prev_index], grads,'batch pos forward hidden, batch pos backward hidden -> forward backward')
             s = s.squeeze(1)#.to(scores.device)
+            # GQA (e.g. Mistral): hook_k_input / hook_v_input gradients have
+            # n_key_value_heads columns but the score matrix is indexed with
+            # n_heads.  Broadcast each KV head to its query-head group.
+            target = scores[:prev_index, bwd_index]
+            if s.shape[-1] != target.shape[-1]:
+                if target.shape[-1] % s.shape[-1] != 0:
+                    raise RuntimeError(
+                        f"GQA head mismatch at {hook.name}: score width "
+                        f"{target.shape[-1]} vs grad width {s.shape[-1]}"
+                    )
+                s = s.repeat_interleave(target.shape[-1] // s.shape[-1], dim=-1)
             scores[:prev_index, bwd_index] += s
         except RuntimeError as e:
             print("Gradient Hook Error", hook.name, activation_difference.size(), grads.size(), prev_index, bwd_index)
