@@ -34,6 +34,27 @@ command -v conda >/dev/null || {
 eval "$(conda shell.bash hook)"
 conda activate "${CONDA_ENV_NAME}"
 
+# ── GPU pre-flight ───────────────────────────────────────────────────────────
+# Reproducible cudaErrorDevicesUnavailable usually means the assigned GPU is
+# wedged/occupied.  Log the GPU state and fail fast (before the model download)
+# so the node can be identified and excluded.
+echo "── GPU pre-flight ────────────────────────────────────────────"
+echo "  NODE              : $(hostname)"
+echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv 2>&1 || \
+    echo "  [WARN] nvidia-smi failed"
+python - <<'PY' || { echo "[ERROR] CUDA not usable on $(hostname); resubmit (exclude this node if it recurs)."; exit 1; }
+import sys, torch
+if not torch.cuda.is_available():
+    print("  [ERROR] torch.cuda.is_available() == False"); sys.exit(1)
+try:
+    torch.zeros(8, device="cuda").sum().item()
+    print(f"  [OK] CUDA usable: {torch.cuda.get_device_name(0)}")
+except Exception as exc:
+    print(f"  [ERROR] CUDA alloc failed: {exc}"); sys.exit(1)
+PY
+echo "──────────────────────────────────────────────────────────────"
+
 [ -f "${DATA_JSONL}" ] || {
   echo "[ERROR] Missing data file: ${DATA_JSONL}" >&2
   exit 1

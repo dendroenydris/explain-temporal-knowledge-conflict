@@ -1,7 +1,9 @@
 """Model loading, prompt formatting, and tokenization utilities for TATM."""
 from __future__ import annotations
 
+import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -166,15 +168,71 @@ def load_model(
         refactor_factored_attn_matrices=False,
     )
 
-    model = HookedTransformer.from_pretrained(
-        model_name,
-        device=device,
-        dtype=dtype,
-        **no_proc_kwargs,
-        **extra_kwargs,
-    )
-    model.eval()
-    return model
+    def _is_transient_cuda_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(s in msg for s in (
+            "busy or unavailable",
+            "cudaerrordevicesunavailable",
+            "all cuda-capable devices are busy",
+            "no cuda-capable device",
+            "cuda error: out of memory",
+            "cuda-capable device(s) is/are busy",
+        ))
+
+    # Retry config (overridable via env on the sbatch call).
+    max_retries = int(os.environ.get("LOAD_MODEL_RETRIES", "4"))
+    retry_wait = float(os.environ.get("LOAD_MODEL_RETRY_WAIT", "45"))
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            model = HookedTransformer.from_pretrained(
+                model_name,
+                device=device,
+                dtype=dtype,
+                **no_proc_kwargs,
+                **extra_kwargs,
+            )
+            model.eval()
+            return model
+        except Exception as exc:  # noqa: BLE001 — need broad catch for CUDA driver errors
+            last_exc = exc
+            transient = device == "cuda" and _is_transient_cuda_error(exc)
+            if not transient or attempt == max_retries:
+                break
+            print(f"  [load_model] CUDA transiently unavailable "
+                  f"(attempt {attempt}/{max_retries}): {exc}")
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            except Exception:  # noqa: BLE001
+                pass
+            print(f"  [load_model] retrying in {retry_wait:.0f}s …")
+            time.sleep(retry_wait)
+
+    # Last resort: build on CPU (avoids the on-CUDA weight conversion), then move.
+    if device == "cuda" and last_exc is not None and _is_transient_cuda_error(last_exc):
+        print("  [load_model] GPU still unavailable — building on CPU then moving "
+              "to CUDA (one allocation pass instead of many).")
+        try:
+            model = HookedTransformer.from_pretrained(
+                model_name,
+                device="cpu",
+                dtype=dtype,
+                **no_proc_kwargs,
+                **extra_kwargs,
+            )
+            model = model.to("cuda")
+            model.eval()
+            return model
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+
+    raise RuntimeError(
+        f"Failed to load {model_name} on device={device} after {max_retries} "
+        f"attempts. Last error: {last_exc}. If this persists the assigned GPU is "
+        f"wedged — resubmit excluding that node (see sacct NodeList)."
+    ) from last_exc
 
 
 # ── Prompt formatting ────────────────────────────────────────────────────────
