@@ -58,6 +58,7 @@ _root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_root / "source"))
 
 from tatm.f2_diagnosis import (
+    DLA_F1F2_TAU,
     F2_DEFAULT_P_FINAL_HIGH,
     F2_DEFAULT_PEAK_LOW_THR,
     F2_DEFAULT_RS_F3_THR,
@@ -67,7 +68,9 @@ from tatm.f2_diagnosis import (
     compute_route_scores,
     load_f1_consistency,
     load_f1_positive_map,
+    mcnemar_test,
     run_str_patching,
+    run_str_patching_resid_sweep,
 )
 from tatm.model import (
     build_prompt,
@@ -482,6 +485,8 @@ def run_f2b(
         rs_f3_thr=rs_f3_thr,
         peak_low_thr=peak_low_thr,
         cached_trajectories=cached_trajectories,
+        temporal_heads=temporal_heads,
+        compute_dla=True,
         verbose=True,
     )
 
@@ -514,12 +519,38 @@ def run_f2b(
     print(f"  Mean  P(answer_new) at L_final:{np.mean(p_at_final):.4f}")
     print(f"  Mean  RouteScore (L_T basis):  {np.mean(route_scores):+.4f}")
     print(f"  Mean  RouteScore (peak basis): {np.mean(route_scores_peak):+.4f}")
-    print(f"\n  F2 regime distribution (per-instance):")
+    print(f"\n  F2 regime distribution (per-instance, DESCRIPTIVE only):")
     for label, count in regime_counts.items():
         print(f"    {label:>10s}: {count:>4d} ({100*count/len(results):5.1f}%)")
     print(f"    {'F2 pooled':>10s}: {n_f2_pooled:>4d} "
           f"({100*n_f2_pooled/len(results):5.1f}%)  "
-          "(F2-strong + F2-weak, methodology line 294)")
+          "(F2-strong + F2-weak collapsed; absolute-threshold regime demoted)")
+
+    # ── DLA readout (AUTHORITATIVE F1/F2 separator, Ortu 2024) ──────────────
+    dla_vals   = [r.dla_ht_sum for r in results if r.dla_ht_sum is not None]
+    dla_labels = [r.dla_f1_vs_f2 for r in results if r.dla_f1_vs_f2 is not None]
+    n_dla      = len(dla_vals)
+    n_dla_f2   = dla_labels.count("F2")
+    n_dla_f1   = dla_labels.count("F1")
+    if n_dla:
+        print(f"\n  DLA readout (H_T direct attribution onto answer_new−answer_old):")
+        print(f"    n with DLA          : {n_dla}/{len(results)}")
+        print(f"    mean Σ DLA(H_T)     : {np.mean(dla_vals):+.4f}  (logit units)")
+        print(f"    median Σ DLA(H_T)   : {np.median(dla_vals):+.4f}")
+        print(f"    DLA-says-F2 (writes): {n_dla_f2:>4d} ({100*n_dla_f2/n_dla:5.1f}%)")
+        print(f"    DLA-says-F1 (no-write): {n_dla_f1:>4d} ({100*n_dla_f1/n_dla:5.1f}%)")
+
+    # ── Lens-decodable coverage (reuse first_rank_competitive_layer) ────────
+    # An instance is "lens-decodable" iff answer_new became rank-competitive at
+    # a NON-FINAL layer (high-crystallization models route only at the last
+    # layer, so the lens legs are uninformative there).  No separate filter.
+    def _decodable(r) -> bool:
+        l_final = len(r.trajectory.probs_new) - 1
+        return 0 <= r.first_rank_competitive_layer < l_final
+    n_decodable = sum(1 for r in results if _decodable(r))
+    coverage = n_decodable / len(results)
+    print(f"\n  Lens-decodable coverage     : {n_decodable}/{len(results)} "
+          f"({100*coverage:5.1f}%)  (rank-competitive before final layer)")
 
     output = {
         "l_t": l_t,
@@ -536,6 +567,24 @@ def run_f2b(
         "n": len(results),
         "regime_counts": regime_counts,
         "regime_pooled_f2": n_f2_pooled,
+        "regime_note": (
+            "f2_regime is DESCRIPTIVE only (absolute-threshold, Phi-3-calibrated, "
+            "non-portable); the verdict uses DLA (authoritative) + rank (cross-check)."
+        ),
+        "dla": {
+            "n_with_dla": n_dla,
+            "n_dla_f2_writes": n_dla_f2,
+            "n_dla_f1_no_write": n_dla_f1,
+            "mean_dla_ht_sum": float(np.mean(dla_vals)) if n_dla else None,
+            "median_dla_ht_sum": float(np.median(dla_vals)) if n_dla else None,
+            "tau": DLA_F1F2_TAU,
+        },
+        "lens_decodable_coverage": {
+            "n_decodable": n_decodable,
+            "n_total": len(results),
+            "coverage": coverage,
+            "criterion": "first_rank_competitive_layer in [0, L_final)",
+        },
         "mean_p_new_at_lt": float(np.mean(p_at_lt)),
         "mean_p_new_peak": float(np.mean(p_at_peak)),
         "mean_peak_layer": float(np.mean(peak_layers)),
@@ -557,7 +606,13 @@ def run_f2b(
                 "p_new_at_final": r.p_new_at_final,
                 "route_score": r.route_score,
                 "route_score_peak": r.route_score_peak,
-                "f2_regime": r.f2_regime,
+                "f2_regime": r.f2_regime,           # descriptive only (demoted)
+                "first_rank_competitive_layer": r.first_rank_competitive_layer,
+                "rank_new_final": r.rank_new_final,
+                "routed": r.routed,
+                "dla_ht_sum": r.dla_ht_sum,
+                "dla_per_head": r.dla_per_head,
+                "dla_f1_vs_f2": r.dla_f1_vs_f2,
                 # Full trajectory arrays (useful for plotting)
                 "probs_new": r.trajectory.probs_new.tolist(),
                 "probs_old": r.trajectory.probs_old.tolist(),
@@ -636,6 +691,23 @@ def run_f2c(
     print(f"    B1-fail ∩ B5-success ∩ B6-success : "
           f"{result.n_b1f_b5s_b6s:>4d}   (dual-evidence rescue regardless of year)")
 
+    # ── PRIMARY STATISTIC: McNemar paired test on the discordant cells ──────
+    # B5 vs B6 are the SAME instances; the correct test is McNemar on the
+    # discordant pairs (b = B5✓B6✗, c = B5✗B6✓), not the unpaired +ΔB5−B6 gap.
+    mcnemar = mcnemar_test(
+        result.n_b5_success_b6_fail,   # b: year helped
+        result.n_b5_fail_b6_success,   # c: year hurt
+    )
+    print("\n  ── PRIMARY STATISTIC: McNemar paired test (B5 vs B6) ───────────")
+    print(f"    Discordant: b(B5✓B6✗)={mcnemar['b_b5success_b6fail']}  "
+          f"c(B5✗B6✓)={mcnemar['c_b5fail_b6success']}  "
+          f"(n_disc={mcnemar['n_discordant']}, odds b/c={mcnemar['odds_b_over_c']:.1f})")
+    if mcnemar.get("chi2") is not None:
+        print(f"    χ²(cont.)={mcnemar['chi2']:.2f}  "
+              f"p_chi2={mcnemar['p_chi2_continuity']:.3g}  "
+              f"p_exact={mcnemar['p_exact']:.3g}  "
+              f"(prefer: {mcnemar['prefer']})")
+
     if result.b5_accuracy > result.b6_accuracy + 0.05:
         print("\n  → B5 >> B6: year in evidence is a critical routing signal.")
     elif result.b5_accuracy <= result.b6_accuracy + 0.05:
@@ -646,6 +718,8 @@ def run_f2c(
         "b1_accuracy": result.b1_accuracy,
         "b5_accuracy": result.b5_accuracy,
         "b6_accuracy": result.b6_accuracy,
+        # PRIMARY statistic for F2-c (plan: mcnemar)
+        "mcnemar_b5_vs_b6": mcnemar,
         # Primary (B5 × B6) — methodology lines 340–344
         "b5xb6_primary": {
             "n_b5_success_b6_fail":     result.n_b5_success_b6_fail,
@@ -748,6 +822,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--f2a-resid-sweep", action="store_true",
+        help=(
+            "[OPTIONAL] Also run the residual-stream layer-sweep STR patcher "
+            "(broad→granular localization).  Only needed when head-level STR "
+            "recovery is weak on a lens-decodable model; off by default."
+        ),
+    )
+    parser.add_argument(
+        "--f2a-resid-hook", default="resid_pre", choices=["resid_pre", "resid_post"],
+        help="Residual hook point for --f2a-resid-sweep (default resid_pre).",
+    )
+    parser.add_argument(
         "--lens-kind", default="raw", choices=["raw", "tuned"],
         help=(
             "Logit-Lens flavour for F2-b's trajectory.  Methodology F3-a "
@@ -771,7 +857,7 @@ def main():
         "--f1-results",
         help=(
             "Optional path to F1-a output JSON (typically "
-            "results/f1_diagnostic/f1a_sat_probe.json).  When provided, "
+            "results2/f1_diagnostic_1000_<tag>/f1a_sat_probe.json).  When provided, "
             "every F2 verdict is cross-referenced against F1-a Step 5's "
             "per-instance F1-positive verdict (methodology line 284): "
             "F1-positive ⇒ year not read ⇒ classified F1, not F2."
@@ -788,7 +874,7 @@ def main():
         "--f1b-results",
         help=(
             "Optional path to F1-b output JSON (typically "
-            "results/f1_diagnostic/f1b_attention_comparison.json).  When "
+            "results2/f1_diagnostic_1000_<tag>/f1b_attention_comparison.json).  When "
             "provided, the population-level Mann-Whitney p-value is read "
             "and every F2 verdict is suffixed with ``_f1b_nonsignif`` if "
             "F1-b fails to confirm the 'Time Set' population premise "
@@ -974,6 +1060,19 @@ def main():
     # ── F2-a ───────────────────────────────────────────────────────────────
     if "f2a" not in args.skip:
         run_f2a(model, b5_instances, temporal_heads, args.template, out_dir)
+        if args.f2a_resid_sweep:
+            print("\n  [F2-a OPTIONAL] residual-stream layer sweep "
+                  f"({args.f2a_resid_hook}) ...")
+            resid_out = run_str_patching_resid_sweep(
+                model, b5_instances, template=args.template,
+                hook_point=args.f2a_resid_hook, verbose=True,
+            )
+            with open(out_dir / "f2a_resid_sweep.json", "w") as f:
+                json.dump(resid_out, f, indent=2, ensure_ascii=False)
+            if resid_out["per_layer"]:
+                best = max(resid_out["per_layer"], key=lambda d: d["mean_recovery"])
+                print(f"    Peak residual recovery at layer {best['layer']} "
+                      f"(mean={best['mean_recovery']:+.3f}); wrote f2a_resid_sweep.json")
 
     # ── F2-b ───────────────────────────────────────────────────────────────
     route_results = []
@@ -1054,16 +1153,15 @@ def main():
             verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
 
         print("\n  ── Final F2 verdict (per-instance, F1-cross-referenced) ─────")
-        # Display order: clean → unverified → f1b_nonsignif suffixes.
+        # Verdict labels collapsed: F2-strong/F2-weak → "F2"; f1b is now a
+        # separate boolean field, not a suffix.  Display order: clean → unverified.
         verdict_label_order = []
         for base in [
-            "F1", "F2_strong", "F2_weak", "F3_candidate",
+            "F1", "F2", "F3_candidate",
             "not_routing_failure", "undetermined",
         ]:
             verdict_label_order.append(base)
             verdict_label_order.append(f"{base}_unverified")
-            verdict_label_order.append(f"{base}_f1b_nonsignif")
-            verdict_label_order.append(f"{base}_unverified_f1b_nonsignif")
         # Catch anything else we didn't enumerate
         for k in sorted(verdict_counts.keys()):
             if k not in verdict_label_order:
@@ -1073,6 +1171,11 @@ def main():
             if count:
                 print(f"    {label:>36s}: {count:>4d} "
                       f"({100*count/len(verdicts):5.1f}%)")
+        n_f1b_nonsignif = sum(1 for v in verdicts if v.get("f1b_nonsignif"))
+        if n_f1b_nonsignif:
+            print(f"    [soft annotation] f1b_nonsignif=True on "
+                  f"{n_f1b_nonsignif}/{len(verdicts)} instances "
+                  "(premise now carried by F2-c McNemar, not F1-b).")
 
         verdict_output = {
             "n": len(verdicts),

@@ -271,6 +271,23 @@ _TEMPLATES: dict[str, dict[str, str]] = {
             "Question: {question} [/INST]"
         ),
     },
+    # Mistral-Instruct chat template  (<s>[INST] ... [/INST]).
+    # Mistral v0.1/v0.2 has no dedicated system role, so the instruction is
+    # folded into the first user turn (same [INST] format as llama2 minus the
+    # <<SYS>> block).  BOS is intentionally omitted to match the codebase
+    # convention (llama2 also omits it; generation uses prepend_bos=False).
+    "mistral": {
+        "with_ctx": (
+            "[INST] Answer the question based on the provided context. "
+            "Give a short, direct answer.\n\n"
+            "Context: {context}\n\nQuestion: {question} [/INST]"
+        ),
+        "no_ctx": (
+            "[INST] Answer the question. "
+            "Give a short, direct answer.\n\n"
+            "Question: {question} [/INST]"
+        ),
+    },
     # Phi-3 chat template  (<|user|> ... <|end|> \n <|assistant|>)
     "phi3": {
         "with_ctx": (

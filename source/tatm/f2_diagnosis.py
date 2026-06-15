@@ -20,6 +20,7 @@ F2-c  B5 vs B6 Behavioral Cross-Analysis — cheapest F2 detector.
 from __future__ import annotations
 
 import gc
+import math
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional
@@ -276,6 +277,145 @@ def run_str_patching(
     return results
 
 
+def _patch_resid_hook(
+    resid: torch.Tensor,
+    hook,
+    *,
+    clean_resid: torch.Tensor,
+    positions: list[int],
+) -> torch.Tensor:
+    """Replace resid[batch, positions, :] with values from *clean_resid*."""
+    patched = resid.clone()
+    for pos in positions:
+        patched[:, pos, :] = clean_resid[:, pos, :]
+    return patched
+
+
+def run_str_patching_resid_sweep(
+    model: HookedTransformer,
+    instances: list[dict],
+    *,
+    template: str = "plain",
+    hook_point: str = "resid_pre",
+    verbose: bool = True,
+) -> dict:
+    """[OPTIONAL] Residual-stream layer-sweep STR patching (broad→granular).
+
+    Only needed when the head-level :func:`run_str_patching` shows weak recovery
+    on a lens-decodable model: it answers *where* the year signal lives by
+    patching the **whole residual stream** at the diffed (question-year) token
+    positions, one layer at a time, and measuring logit-difference recovery
+    per layer (Zhang & Nanda 2024 "broad localization before granular").
+
+    Returns ``{"hook_point", "n", "per_layer": [{layer, mean_recovery,
+    median_recovery, pct_ge_50}], "per_instance": [...]}``.  Same behavioral
+    filter as the head-level patcher (clean→answer_new, corrupted→answer_old).
+    """
+    n_layers = model.cfg.n_layers
+    hp = {"resid_pre": "hook_resid_pre", "resid_post": "hook_resid_post"}[hook_point]
+
+    # per_layer_recoveries[l] accumulates logit-diff recovery across instances.
+    per_layer_recoveries: list[list[float]] = [[] for _ in range(n_layers)]
+    per_instance: list[dict] = []
+    skipped = {"gen_clean": 0, "gen_corr": 0, "len_mismatch": 0,
+               "no_diff": 0, "token_id": 0}
+
+    bar = tqdm(instances, desc=f"F2-a  resid sweep ({hook_point})", disable=not verbose)
+    for inst in bar:
+        iid = inst.get("instance_id", "")
+        question = inst.get("question", "")
+        context = inst.get("context", "")
+        answer_new = inst.get("answer_new", "")
+        answer_old = inst.get("answer_old", "")
+        t_new = inst.get("t_new")
+        t_old = inst.get("t_old")
+        if t_new is None or t_old is None:
+            continue
+
+        clean_prompt = build_prompt(context, question, template=template)
+        corrupted_q = question.replace(str(t_new), str(t_old))
+        corrupted_prompt = build_prompt(context, corrupted_q, template=template)
+        clean_tokens = model.to_tokens(clean_prompt, prepend_bos=False)
+        corrupted_tokens = model.to_tokens(corrupted_prompt, prepend_bos=False)
+        if clean_tokens.shape != corrupted_tokens.shape:
+            skipped["len_mismatch"] += 1
+            continue
+        diff_pos = (clean_tokens[0] != corrupted_tokens[0]).nonzero(
+            as_tuple=True)[0].tolist()
+        if not diff_pos:
+            skipped["no_diff"] += 1
+            continue
+
+        clean_gen = generate_answer(model, clean_prompt)
+        if not check_match(clean_gen, answer_new):
+            skipped["gen_clean"] += 1
+            continue
+        corrupted_gen = generate_answer(model, corrupted_prompt)
+        if not check_match(corrupted_gen, answer_old):
+            skipped["gen_corr"] += 1
+            continue
+
+        new_tid = get_first_answer_token(model, answer_new)
+        old_tid = get_first_answer_token(model, answer_old)
+        if new_tid < 0 or old_tid < 0 or new_tid == old_tid:
+            skipped["token_id"] += 1
+            continue
+
+        cache_names = {f"blocks.{l}.{hp}" for l in range(n_layers)}
+        with torch.no_grad():
+            clean_logits, cache = model.run_with_cache(
+                clean_tokens, names_filter=lambda n: n in cache_names,
+                prepend_bos=False,
+            )
+            corr_last = model(corrupted_tokens, prepend_bos=False)[0, -1].float().cpu()
+        clean_last = clean_logits[0, -1].float().cpu()
+        ld_clean = (clean_last[new_tid] - clean_last[old_tid]).item()
+        ld_corr  = (corr_last[new_tid]  - corr_last[old_tid]).item()
+        denom = ld_clean - ld_corr
+
+        inst_row = {"instance_id": iid, "recovery_by_layer": {}}
+        for layer in range(n_layers):
+            cached_resid = cache[f"blocks.{layer}.{hp}"]
+            hook = (f"blocks.{layer}.{hp}", partial(
+                _patch_resid_hook, clean_resid=cached_resid, positions=diff_pos))
+            with torch.no_grad():
+                patched_last = model.run_with_hooks(
+                    corrupted_tokens, fwd_hooks=[hook], prepend_bos=False,
+                )[0, -1].float().cpu()
+            ld_patch = (patched_last[new_tid] - patched_last[old_tid]).item()
+            rec = (ld_patch - ld_corr) / denom if abs(denom) > 1e-6 else 0.0
+            per_layer_recoveries[layer].append(rec)
+            inst_row["recovery_by_layer"][layer] = rec
+
+        per_instance.append(inst_row)
+        del cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        bar.set_postfix(ok=len(per_instance))
+    bar.close()
+
+    per_layer = []
+    for layer in range(n_layers):
+        recs = per_layer_recoveries[layer]
+        if recs:
+            per_layer.append({
+                "layer": layer,
+                "mean_recovery": float(np.mean(recs)),
+                "median_recovery": float(np.median(recs)),
+                "pct_ge_50": float(sum(1 for r in recs if r >= 0.5) / len(recs)),
+            })
+    if verbose and any(skipped.values()):
+        parts = [f"{k}={v}" for k, v in skipped.items() if v]
+        print(f"  [F2-a resid sweep] Skipped: {', '.join(parts)}")
+    return {
+        "hook_point": hook_point,
+        "n": len(per_instance),
+        "per_layer": per_layer,
+        "per_instance": per_instance,
+    }
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # F2-b  RouteScore
 # ═════════════════════════════════════════════════════════════════════════════
@@ -332,6 +472,16 @@ class RouteScoreResult:
     first_rank_competitive_layer: int = -1
     rank_new_final: int = -1
     routed: bool = False
+    # ── DLA readout (Ortu 2024; AUTHORITATIVE F1/F2 separator) ────────────────
+    # Per-temporal-head direct logit attribution onto (answer_new − answer_old)
+    # after the final LN.  Late-crystallization-robust: it measures whether the
+    # temporal heads *write* the answer direction, regardless of when the full
+    # residual crystallizes.  ``dla_f1_vs_f2`` = "F2" if H_T writes the answer
+    # direction (dla_ht_sum > DLA_F1F2_TAU) else "F1".  ``None`` if DLA was not
+    # computed.  CAVEAT: direct effects only (misses indirect head→MLP routing).
+    dla_ht_sum: float | None = None
+    dla_per_head: dict[str, float] | None = None
+    dla_f1_vs_f2: str | None = None
 
 
 # Default regime thresholds — match methodology F3-a's τ = 0.10 default and
@@ -345,6 +495,72 @@ F2_DEFAULT_PEAK_LOW_THR    = 0.05   # absolute peak P^l below this ⇒ "never ri
 #: Measurable-redesign PRIMARY readout; the absolute thresholds above are the
 #: legacy/Optional-hardening path (methodology F2-b).
 F2_RANK_COMPETITIVE        = 10
+#: DLA threshold for the authoritative F1-vs-F2 separator (Ortu 2024).  H_T is
+#: said to "write" the answer direction iff the summed per-head direct logit
+#: attribution onto (answer_new − answer_old) exceeds this.  0.0 = any net
+#: positive direct contribution counts as "written" (F2); ≤ 0 ⇒ "not written"
+#: (F1).  In logit units.
+DLA_F1F2_TAU               = 0.0
+
+
+def compute_temporal_head_dla(
+    model: HookedTransformer,
+    tokens: torch.Tensor,
+    temporal_heads: list[tuple[int, int]],
+    new_tid: int,
+    old_tid: int,
+) -> tuple[dict[str, float], float]:
+    """Direct logit attribution of each temporal head onto (new − old).
+
+    For head ``(l, h)`` the direct contribution to the final logit difference
+    ``logit(answer_new) − logit(answer_old)`` is
+
+        DLA(l, h) = ( (z[l,h] @ W_O[l,h]) / scale * γ_final ) · (W_U[:,new] − W_U[:,old])
+
+    where ``scale`` is the final-LayerNorm scale captured during the real
+    forward pass (frozen, standard DLA practice) and ``γ_final`` is the final-LN
+    weight.  This is late-crystallization-robust: it measures whether the head
+    *writes* the answer direction, independent of when the full residual
+    crystallizes (Ortu et al. 2024).  CAVEAT: direct effects only — indirect
+    routing (head → later MLP) is invisible to DLA, so pair it with causal
+    patching and do not treat it as a complete account.
+
+    Returns ``(per_head_dla, total)`` where keys are ``"l.h"`` strings.  On any
+    failure returns ``({}, 0.0)`` so callers can fall back to the rank readout.
+    """
+    try:
+        layers = sorted({l for l, _ in temporal_heads})
+        wanted = {f"blocks.{l}.attn.hook_z" for l in layers}
+        wanted.add("ln_final.hook_scale")
+        with torch.no_grad():
+            _, cache = model.run_with_cache(
+                tokens, names_filter=lambda n: n in wanted, prepend_bos=False,
+            )
+        # (new − old) unembedding direction; centering cancels in the diff.
+        dir_vec = (model.W_U[:, new_tid] - model.W_U[:, old_tid]).float()  # [d_model]
+        scale = cache["ln_final.hook_scale"][0, -1].float()               # [1]
+        gamma = getattr(getattr(model, "ln_final", None), "w", None)
+        gamma = gamma.float() if gamma is not None else None
+
+        per_head: dict[str, float] = {}
+        total = 0.0
+        for (l, h) in temporal_heads:
+            z = cache[f"blocks.{l}.attn.hook_z"][0, -1, h].float()  # [d_head]
+            head_out = z @ model.W_O[l, h].float()                  # [d_model]
+            normed = head_out / scale
+            if gamma is not None:
+                normed = normed * gamma
+            contrib = float(normed @ dir_vec)
+            per_head[f"{l}.{h}"] = contrib
+            total += contrib
+        del cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return per_head, total
+    except Exception as exc:  # noqa: BLE001 — DLA is best-effort; fall back to rank
+        print(f"  [DLA] WARNING: attribution failed ({exc}); "
+              "falling back to rank-based readout for this instance.")
+        return {}, 0.0
 
 
 def classify_f2_regime(
@@ -419,6 +635,9 @@ def compute_route_scores(
     rs_f3_thr: float = F2_DEFAULT_RS_F3_THR,
     peak_low_thr: float = F2_DEFAULT_PEAK_LOW_THR,
     cached_trajectories: dict[str, "LogitTrajectory"] | None = None,
+    temporal_heads: list[tuple[int, int]] | None = None,
+    compute_dla: bool = True,
+    dla_tau: float = DLA_F1F2_TAU,
     verbose: bool = True,
 ) -> tuple[list[RouteScoreResult], int]:
     """F2-b: Compute RouteScore for each instance.
@@ -489,6 +708,7 @@ def compute_route_scores(
         if new_tid < 0 or old_tid < 0 or new_tid == old_tid:
             continue
 
+        tokens = None
         if iid and iid in cache:
             traj = cache[iid]
             n_cache_hits += 1
@@ -519,7 +739,7 @@ def compute_route_scores(
             peak_low_thr=peak_low_thr,
         )
 
-        # Rank-based readout (measurable-redesign PRIMARY).
+        # Rank-based readout (measurable-redesign, cross-check).
         ranks_new = getattr(traj, "ranks_new", None)
         if ranks_new is not None and len(ranks_new) > 0:
             ranks_arr = np.asarray(ranks_new)
@@ -528,6 +748,19 @@ def compute_route_scores(
             rank_final = int(ranks_arr[-1])
         else:
             first_rc, rank_final = -1, -1
+
+        # DLA readout (AUTHORITATIVE F1/F2 separator, Ortu 2024).
+        dla_per_head: dict[str, float] | None = None
+        dla_sum: float | None = None
+        dla_label: str | None = None
+        if compute_dla and temporal_heads:
+            if tokens is None:
+                prompt = build_prompt(context, question, template=template)
+                tokens = model.to_tokens(prompt, prepend_bos=False)
+            dla_per_head, dla_sum = compute_temporal_head_dla(
+                model, tokens, temporal_heads, new_tid, old_tid,
+            )
+            dla_label = "F2" if dla_sum > dla_tau else "F1"
 
         results.append(RouteScoreResult(
             instance_id=iid,
@@ -542,6 +775,9 @@ def compute_route_scores(
             first_rank_competitive_layer=first_rc,
             rank_new_final=rank_final,
             routed=(first_rc >= 0),
+            dla_ht_sum=dla_sum,
+            dla_per_head=dla_per_head,
+            dla_f1_vs_f2=dla_label,
         ))
         bar.set_postfix(rs=f"{rs:+.3f}", regime=regime, n=len(results))
 
@@ -558,6 +794,62 @@ def compute_route_scores(
 # ═════════════════════════════════════════════════════════════════════════════
 # F2-c  B5 vs B6 Behavioral Cross-Analysis
 # ═════════════════════════════════════════════════════════════════════════════
+
+
+def mcnemar_test(b: int, c: int) -> dict:
+    """McNemar's test for the two discordant cells of a paired 2×2 table.
+
+    F2-c compares the SAME instances under B5 (years intact) vs B6 (years
+    stripped).  The correct significance test for this paired, binary outcome
+    is McNemar's test on the discordant pairs, **not** an unpaired comparison
+    of the two marginal accuracies (which ignores the pairing and is what the
+    raw +8.1pp gap reports).
+
+    Parameters
+    ----------
+    b : count of (B5-success ∩ B6-fail) — year helped.
+    c : count of (B5-fail ∩ B6-success) — year hurt.
+
+    Returns a dict with the continuity-corrected χ² statistic + p-value and the
+    exact (binomial) two-sided p-value.  The exact test is preferred when
+    ``b + c`` is small (< 25).  ``odds`` = b/c asymmetry for reporting.
+    """
+    n = b + c
+    out: dict = {
+        "b_b5success_b6fail": int(b),
+        "c_b5fail_b6success": int(c),
+        "n_discordant": int(n),
+        "odds_b_over_c": (float(b) / c) if c else float("inf"),
+    }
+    if n == 0:
+        out.update({
+            "chi2": None, "p_chi2_continuity": None, "p_exact": None,
+            "note": "no discordant pairs",
+        })
+        return out
+
+    # Continuity-corrected χ² (Edwards), 1 dof.
+    chi2 = (abs(b - c) - 1) ** 2 / n if n > 0 else 0.0
+    chi2 = max(chi2, 0.0)
+    # Survival function of χ²_1 = erfc(sqrt(chi2/2)).
+    p_chi2 = math.erfc(math.sqrt(chi2 / 2.0))
+
+    # Exact two-sided binomial test: under H0, b ~ Binomial(n, 0.5).
+    try:
+        from scipy.stats import binomtest  # type: ignore
+        p_exact = float(binomtest(min(b, c), n, 0.5, alternative="two-sided").pvalue)
+    except Exception:
+        k = min(b, c)
+        tail = sum(math.comb(n, i) for i in range(k + 1)) * (0.5 ** n)
+        p_exact = min(1.0, 2.0 * tail)
+
+    out.update({
+        "chi2": float(chi2),
+        "p_chi2_continuity": float(p_chi2),
+        "p_exact": float(p_exact),
+        "prefer": "exact" if n < 25 else "chi2_continuity",
+    })
+    return out
 
 
 @dataclass
@@ -946,11 +1238,15 @@ def assign_f2_verdicts(
       * ``f1_positive``: True / False / None (None = no F1 file or
         instance not present in F1 cohort)
       * ``f2b_regime``: ``"not_f2"`` / ``"f2_strong"`` / ``"f2_weak"`` / ``"f3"``
+        — DESCRIPTIVE only (absolute-threshold regime, demoted from the
+        verdict logic; kept for the appendix figure).
+      * ``routed`` / ``dla_ht_sum`` / ``dla_f1_vs_f2`` / ``written``: the
+        rank-based and DLA readouts driving the verdict.
       * ``verdict``: final per-instance verdict, one of
-        ``"F1"`` / ``"F2_strong"`` / ``"F2_weak"`` / ``"F3_candidate"``
+        ``"F1"`` / ``"F2"`` / ``"F3_candidate"``
         / ``"not_routing_failure"`` / ``"undetermined"`` /
-        ``"…_unverified"`` (no F1-a file) / ``"…_f1b_nonsignif"``
-        (F1-b non-significant).
+        ``"…_unverified"`` (no F1-a file).  F2-strong/F2-weak are collapsed
+        into a single ``"F2"``.  ``f1b_nonsignif`` is a separate boolean.
     """
     by_iid = f1_by_iid or {}
     by_key = f1_by_key or {}
@@ -971,59 +1267,70 @@ def assign_f2_verdicts(
         r = route_by_iid.get(iid)
         is_f1_pos = _f1_lookup(inst, by_iid, by_key)
 
+        # ── Base verdict (plan: routescore-simplify + dla-readout) ───────────
+        # The absolute-threshold f2_regime (strong/weak/f3) is DEMOTED to a
+        # descriptive field (carried as ``f2b_regime``).  The verdict is now
+        # driven by whether H_T *writes* the answer direction:
+        #   • DLA at H_T (AUTHORITATIVE): dla_f1_vs_f2 == "F2" ⇒ written.
+        #   • rank-based ``routed`` (CROSS-CHECK / fallback when DLA absent).
+        # F2-strong vs F2-weak are collapsed into a single "F2".  The "f3"
+        # descriptive regime is preserved as ``F3_candidate`` for instances
+        # that wrote the answer then sharply dropped (causal confirmation is
+        # F3-b/c's job).
         if r is None:
             f2b_regime = None
             base_verdict = "undetermined"
+            written = None
         else:
             f2b_regime = r.f2_regime
+            if r.dla_f1_vs_f2 is not None:
+                written = (r.dla_f1_vs_f2 == "F2")
+            else:
+                written = bool(r.routed)
+
             if f2b_regime == "not_f2":
                 base_verdict = "not_routing_failure"
+            elif not written:
+                # H_T does not write the answer direction ⇒ F1 (not set).
+                base_verdict = "F1"
             elif f2b_regime == "f3":
                 base_verdict = "F3_candidate"
-            elif f2b_regime == "f2_weak":
-                base_verdict = "F2_weak"
-            elif f2b_regime == "f2_strong":
-                base_verdict = "F2_strong"
             else:
-                base_verdict = "undetermined"
+                base_verdict = "F2"
 
         # F1 cross-reference (methodology line 284): F1-positive blocks
-        # any F2 verdict — the failure is F1.  F3_candidate is *also*
-        # blocked, because F3 likewise requires the year to have been
-        # read (Part III's F3 row, and F3-a Method line 424 keying off
-        # B1-failure with F3-trajectory).
-        if is_f1_pos is True and base_verdict in (
-            "F2_strong", "F2_weak", "F3_candidate"
-        ):
+        # any routing-failure verdict — the failure is F1.  F3_candidate is
+        # *also* blocked, because F3 likewise requires the year to have been
+        # read.
+        if is_f1_pos is True and base_verdict in ("F2", "F3_candidate"):
             verdict = "F1"
-        elif is_f1_pos is None and base_verdict in (
-            "F2_strong", "F2_weak", "F3_candidate"
-        ):
-            # No F1 verdict available for this instance — report the F2
-            # regime as ``_unverified`` so downstream readers know the
-            # F1 ruling-out step did not happen.
+        elif is_f1_pos is None and base_verdict in ("F2", "F3_candidate"):
+            # No F1 verdict available for this instance — report with an
+            # ``_unverified`` suffix so downstream readers know the F1
+            # ruling-out step did not happen.
             verdict = f"{base_verdict}_unverified"
         else:
             verdict = base_verdict
 
-        # F1-b consistency: if F1-b is non-significant, every F2 (and F3)
-        # verdict is annotated to signal that the "Time Set" population
-        # premise itself is not validated.  We append the suffix rather
-        # than overwriting so the underlying regime is still readable.
-        if f1b_block and verdict in (
-            "F2_strong", "F2_weak", "F3_candidate",
-            "F2_strong_unverified", "F2_weak_unverified", "F3_candidate_unverified",
-            "F1",
-        ):
-            verdict = f"{verdict}_f1b_nonsignif"
-
+        # F1-b consistency is now a SOFT annotation (plan: verdict-plumbing).
+        # Previously the suffix ``_f1b_nonsignif`` was appended to the verdict
+        # label itself, which made *every* verdict look invalidated when F1-b
+        # was non-significant (the contaminated f2_verdicts.json).  The "Time
+        # Set" premise is now carried by F2-c (B5/B6 McNemar), not by F1-b, so
+        # we keep the verdict label clean and record F1-b status as a separate
+        # boolean field for downstream readers.
         verdicts.append({
             "instance_id": iid,
             "fact_id":     inst.get("fact_id"),
             "t_old":       inst.get("t_old"),
             "t_new":       inst.get("t_new"),
             "f1_positive": is_f1_pos,
-            "f2b_regime":  f2b_regime,
+            "f2b_regime":  f2b_regime,           # descriptive only (demoted)
+            "routed":      (bool(r.routed) if r is not None else None),
+            "dla_ht_sum":  (r.dla_ht_sum if r is not None else None),
+            "dla_f1_vs_f2": (r.dla_f1_vs_f2 if r is not None else None),
+            "written":     written,
             "verdict":     verdict,
+            "f1b_nonsignif": bool(f1b_block),
         })
     return verdicts

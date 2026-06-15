@@ -25,6 +25,12 @@ TEMPORAL_HEADS_MANUAL="${TEMPORAL_HEADS_MANUAL:-10,13}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 DTYPE="${DTYPE:-auto}"
 F2B_POPULATION="${F2B_POPULATION:-reverts_old}"
+# F1 cross-reference (optional): if these exist, F2 verdicts are ruled-out
+# against F1-a Step-5 (per instance) and F1-b is recorded as a SOFT annotation
+# (no longer invalidates the verdicts).  Default to the results2/ F1 dir for
+# this model tag; skipped automatically if the files are absent.
+F1_RESULTS="${F1_RESULTS:-results2/f1_diagnostic_1000_${MODEL_TAG}/f1a_sat_probe.json}"
+F1B_RESULTS="${F1B_RESULTS:-results2/f1_diagnostic_1000_${MODEL_TAG}/f1b_attention_comparison.json}"
 
 command -v conda >/dev/null || {
   echo "[ERROR] conda not found. Run setup-conda3 on the cluster, then create ${CONDA_ENV_NAME} from environment.yml." >&2
@@ -82,6 +88,10 @@ else
   HEAD_ARGS=(--temporal-heads-manual ${TEMPORAL_HEADS_MANUAL})
 fi
 
+# F1 cross-reference (optional; activates the F2 verdict ruling-out + soft f1b).
+if [ -f "${F1_RESULTS}" ];  then ARGS+=(--f1-results  "${F1_RESULTS}");  fi
+if [ -f "${F1B_RESULTS}" ]; then ARGS+=(--f1b-results "${F1B_RESULTS}"); fi
+
 echo "MODEL=${MODEL}"
 echo "MODEL_TAG=${MODEL_TAG}"
 echo "TEMPLATE=${TEMPLATE}"
@@ -89,6 +99,8 @@ echo "TEMPORAL_HEADS_FILE=${TEMPORAL_HEADS_FILE}"
 echo "TEMPORAL_HEADS_MANUAL=${TEMPORAL_HEADS_MANUAL}"
 echo "DTYPE=${DTYPE}"
 echo "F2B_POPULATION=${F2B_POPULATION}"
+echo "F1_RESULTS=${F1_RESULTS} (exists=$([ -f "${F1_RESULTS}" ] && echo yes || echo no))"
+echo "F1B_RESULTS=${F1B_RESULTS} (exists=$([ -f "${F1B_RESULTS}" ] && echo yes || echo no))"
 echo "MAX_INSTANCES=${MAX_INSTANCES:-<all>}"
 echo "SKIP=${SKIP:-<none>}"
 echo "OUT_DIR=${OUT_DIR}"

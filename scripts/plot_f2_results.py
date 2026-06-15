@@ -95,7 +95,7 @@ def panel_a(ax: plt.Axes, data: dict) -> None:
 
     ax.set_xlim(0, 105)
     ax.set_xlabel("Fraction of B1 instances (%)")
-    ax.set_title("B1 Failure Taxonomy\n(Phi-3-mini, n=200)", pad=8)
+    ax.set_title(f"B1 Failure Taxonomy\n(n={n_total})", pad=8)
     ax.axvline(pcts[0], color="black", linewidth=0.6, linestyle=":")
     ax.grid(axis="x")
     ax.grid(axis="y", alpha=0)
@@ -252,7 +252,7 @@ def panel_c(ax: plt.Axes, data: dict) -> None:
     ax.set_xlabel("Recovery fraction  (patched − corrupted) / (clean − corrupted)")
     ax.set_ylabel("# instances")
     ax.set_title(f"F2-a: STR Activation Patching Recovery\n"
-                 f"(Phi-3-mini, n={n_valid} valid instances)", pad=8)
+                 f"(n={n_valid} valid instances)", pad=8)
     ax.legend(frameon=False, fontsize=8.5)
 
     # Summary stats annotation
@@ -325,7 +325,7 @@ def panel_d(ax: plt.Axes, data: dict) -> None:
     ax.set_xlim(-0.5, n_layers - 0.5)
     ax.set_ylim(bottom=0)
     ax.set_title(
-        f"F2-b: Logit Lens Trajectories  (n={len(instances)}, coloured by F2 regime)\n"
+        f"F2-b: Logit Lens Trajectories — DESCRIPTIVE  (n={len(instances)})\n"
         f"Solid = P(answer_new), dashed = P(answer_old).  L_T={l_t} ({l_t_mode}).",
         pad=8,
     )
@@ -403,29 +403,20 @@ def panel_regime(ax: plt.Axes, f2b_data: dict, verdict_data: dict | None) -> Non
 
     # Final verdict bar (F1-cross-referenced)
     if verdict_data is not None and verdict_data.get("verdict_counts"):
-        bars_y.append("F2 verdict\n(F1-crossref)")
+        bars_y.append("F2 verdict\n(DLA + F1-crossref)")
         v_counts = verdict_data["verdict_counts"]
         n_v = sum(v_counts.values()) or 1
-        # Order: not_routing_failure → F1 → F2_strong → F2_weak → F3 → ..._unverified → ..._f1b_nonsignif → undetermined
+        # Collapsed labels: F2-strong/F2-weak → "F2"; f1b is a separate boolean
+        # (no longer a verdict suffix).  Order: not_routing_failure → F1 → F2 → F3.
         verdict_order = [
-            ("not_routing_failure",            C_GREEN,   "not_routing_failure"),
-            ("F1",                             C_BLUE,    "F1 (year not read)"),
-            ("F2_strong",                      C_RED,     "F2_strong"),
-            ("F2_weak",                        C_ORANGE,  "F2_weak"),
-            ("F3_candidate",                   C_PURPLE,  "F3_candidate"),
+            ("not_routing_failure",     C_GREEN,   "not_routing_failure"),
+            ("F1",                      C_BLUE,    "F1 (year not written)"),
+            ("F2",                      C_RED,     "F2 (set, not routed)"),
+            ("F3_candidate",            C_PURPLE,  "F3_candidate"),
             # _unverified — no F1-a per-instance lookup available
-            ("F2_strong_unverified",           "#FFAAAA", "F2_strong (no F1-a ref)"),
-            ("F2_weak_unverified",             "#FFCC99", "F2_weak (no F1-a ref)"),
-            ("F3_candidate_unverified",        "#DDAACC", "F3_cand. (no F1-a ref)"),
-            # _f1b_nonsignif — F1-b Mann-Whitney non-significant
-            ("F1_f1b_nonsignif",                       "#7799CC", "F1 (F1-b non-signif)"),
-            ("F2_strong_f1b_nonsignif",                "#AA5555", "F2_strong (F1-b non-signif)"),
-            ("F2_weak_f1b_nonsignif",                  "#CC8855", "F2_weak (F1-b non-signif)"),
-            ("F3_candidate_f1b_nonsignif",             "#9966AA", "F3_cand. (F1-b non-signif)"),
-            ("F2_strong_unverified_f1b_nonsignif",     "#DD9999", "F2_strong (no F1-a, F1-b NS)"),
-            ("F2_weak_unverified_f1b_nonsignif",       "#DDAA88", "F2_weak (no F1-a, F1-b NS)"),
-            ("F3_candidate_unverified_f1b_nonsignif",  "#BB99CC", "F3_cand. (no F1-a, F1-b NS)"),
-            ("undetermined",                   C_GRAY,    "undetermined"),
+            ("F2_unverified",           "#FFAAAA", "F2 (no F1-a ref)"),
+            ("F3_candidate_unverified", "#DDAACC", "F3_cand. (no F1-a ref)"),
+            ("undetermined",            C_GRAY,    "undetermined"),
         ]
         left = 0
         for key, color, label in verdict_order:
@@ -493,6 +484,94 @@ def panel_d_inset(ax: plt.Axes, data: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Panel DLA  –  Direct Logit Attribution (PRIMARY internal F1/F2 separator)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def panel_dla(ax: plt.Axes, f2b_data: dict) -> None:
+    """Per-instance Σ DLA(H_T) onto (answer_new − answer_old).
+
+    DLA is the AUTHORITATIVE, late-crystallization-robust F1/F2 separator
+    (Ortu 2024): >0 ⇒ H_T writes the answer direction (F2 "set but not
+    routed"); ≤0 ⇒ H_T does not write it (F1 "not set").
+    """
+    instances = f2b_data.get("per_instance", [])
+    vals = [i.get("dla_ht_sum") for i in instances if i.get("dla_ht_sum") is not None]
+    if not vals:
+        ax.text(0.5, 0.5, "No DLA data\n(rerun F2-b with temporal heads)",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=10, color=C_GRAY)
+        ax.set_title("DLA readout (unavailable)", pad=8)
+        _panel_label(ax, "DLA")
+        return
+
+    vals = np.asarray(vals, dtype=float)
+    n_f2 = int((vals > 0).sum())
+    n_f1 = int((vals <= 0).sum())
+    lim = float(np.abs(vals).max()) * 1.05 or 1.0
+    bins = np.linspace(-lim, lim, 30)
+    _, _, patches = ax.hist(vals, bins=bins, color=C_BLUE, edgecolor="white",
+                            linewidth=0.6, zorder=3)
+    for patch, left in zip(patches, bins[:-1]):
+        if left >= 0:
+            patch.set_facecolor(C_ORANGE)
+    ax.axvline(0.0, color="black", linewidth=1.4, linestyle="--",
+               label=r"$\tau=0$  (F1 $\leq 0 <$ F2)")
+    ax.set_xlabel(r"$\sum_{h \in H_T}$ DLA onto (answer_new − answer_old)  [logits]")
+    ax.set_ylabel("# instances")
+    ax.set_title("DLA readout — authoritative F1/F2 separator\n"
+                 f"writes/F2 (>0): {n_f2}   ·   no-write/F1 (≤0): {n_f1}", pad=8)
+    ax.legend(frameon=False, fontsize=8.5)
+    ax.text(0.97, 0.95,
+            f"mean = {vals.mean():+.3f}\nmedian = {np.median(vals):+.3f}",
+            transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
+            color="#333333",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc", alpha=0.8))
+    _panel_label(ax, "DLA")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Panel Summary  –  coverage + DLA split + McNemar (text panel)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def panel_summary(ax: plt.Axes, f2b_data: dict, f2c_data: dict) -> None:
+    """Compact text panel: lens-decodable coverage, DLA split, F2-c McNemar."""
+    ax.axis("off")
+    lines = ["F2 summary readouts", ""]
+
+    cov = f2b_data.get("lens_decodable_coverage")
+    if cov:
+        lines.append("Lens-decodable coverage (rank-competitive before final layer):")
+        lines.append(f"  {cov.get('n_decodable','?')}/{cov.get('n_total','?')}"
+                     f"  ({100*cov.get('coverage',0):.1f}%)")
+        lines.append("")
+
+    dla = f2b_data.get("dla")
+    if dla and dla.get("n_with_dla"):
+        lines.append("DLA F1/F2 separation (authoritative):")
+        lines.append(f"  writes/F2: {dla.get('n_dla_f2_writes','?')}   "
+                     f"no-write/F1: {dla.get('n_dla_f1_no_write','?')}")
+        md = dla.get("median_dla_ht_sum")
+        if md is not None:
+            lines.append(f"  median Σ DLA(H_T) = {md:+.3f}")
+        lines.append("")
+
+    mc = f2c_data.get("mcnemar_b5_vs_b6")
+    if mc:
+        lines.append("F2-c McNemar (PRIMARY; B5 vs B6, paired):")
+        lines.append(f"  b(B5✓B6✗)={mc.get('b_b5success_b6fail','?')}  "
+                     f"c(B5✗B6✓)={mc.get('c_b5fail_b6success','?')}  "
+                     f"(odds {mc.get('odds_b_over_c',float('nan')):.1f}×)")
+        if mc.get("chi2") is not None:
+            lines.append(f"  χ²(cont.)={mc['chi2']:.2f}  p_exact={mc['p_exact']:.3g}  "
+                         f"(prefer {mc.get('prefer','?')})")
+
+    ax.text(0.0, 1.0, "\n".join(lines), transform=ax.transAxes,
+            ha="left", va="top", fontsize=9, family="monospace", color="#222222",
+            bbox=dict(boxstyle="round,pad=0.5", fc="#F4F4F8", ec="#CCCCCC", alpha=0.95))
+    _panel_label(ax, "S")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -502,8 +581,11 @@ def main():
                         help="Directory containing F2 JSON result files")
     parser.add_argument("--out",     default="results/f2_diagnostic/figures",
                         help="Output directory for figures")
+    parser.add_argument("--model-tag", default="phi3",
+                        help="Model label for figure titles (phi3 / llama2 / mistral)")
     args = parser.parse_args()
 
+    model_label = args.model_tag
     res_dir = Path(args.results)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -519,32 +601,40 @@ def main():
     verdict_path = res_dir / "f2_verdicts.json"
     verdict_data = _load(verdict_path) if verdict_path.exists() else None
 
-    # ── Figure 1: 5-panel summary  (A | B over C | D, with E full-width) ─────
-    fig = plt.figure(figsize=(14, 13))
+    # ── Figure 1: 7-panel summary ────────────────────────────────────────────
+    #   row0: A taxonomy   | B F2-c behavioral
+    #   row1: C STR recov. | D trajectories (descriptive)
+    #   row2: DLA (primary)| S summary (coverage/DLA/McNemar)
+    #   row3: E verdict distribution (full-width)
+    fig = plt.figure(figsize=(14, 17))
     gs  = gridspec.GridSpec(
-        3, 2,
+        4, 2,
         figure=fig,
         hspace=0.65,
         wspace=0.38,
         left=0.07, right=0.97,
-        top=0.93,  bottom=0.08,
-        height_ratios=[1.0, 1.0, 0.7],
+        top=0.94,  bottom=0.06,
+        height_ratios=[1.0, 1.0, 1.0, 0.7],
     )
 
     ax_a = fig.add_subplot(gs[0, 0])
     ax_b = fig.add_subplot(gs[0, 1])
     ax_c = fig.add_subplot(gs[1, 0])
     ax_d = fig.add_subplot(gs[1, 1])
-    ax_e = fig.add_subplot(gs[2, :])     # full-width F2 regime panel
+    ax_dla = fig.add_subplot(gs[2, 0])
+    ax_s = fig.add_subplot(gs[2, 1])
+    ax_e = fig.add_subplot(gs[3, :])     # full-width F2 verdict distribution
 
     panel_a(ax_a, filter_data)
     panel_b(ax_b, f2c_data)
     panel_c(ax_c, f2a_data)
     panel_d(ax_d, f2b_data)
+    panel_dla(ax_dla, f2b_data)
+    panel_summary(ax_s, f2b_data, f2c_data)
     panel_regime(ax_e, f2b_data, verdict_data)
 
     fig.suptitle(
-        'F2 Diagnostic: "Time Set but Not Routed"  —  Phi-3-mini-4k-instruct',
+        f'F2 Diagnostic: "Time Set but Not Routed"  —  {model_label}',
         fontsize=13, fontweight="bold", y=0.97,
     )
 
@@ -563,7 +653,7 @@ def main():
     panel_d(axes2[0], f2b_data)
     panel_d_inset(axes2[1], f2b_data)
     fig2.suptitle(
-        "F2-b: Logit Lens  ·  Phi-3-mini-4k-instruct  ·  REVERTS_OLD instances",
+        f"F2-b: Logit Lens (descriptive)  ·  {model_label}  ·  failure cohort",
         fontsize=12, fontweight="bold",
     )
     for fmt in ("pdf", "png"):
@@ -599,7 +689,7 @@ def main():
     ax3.set_ylabel("Logit diff (patched run:  temporal heads restored)")
     ax3.set_title(
         "F2-a: STR Patching — Corrupted vs Patched Logit Diffs\n"
-        f"(Phi-3-mini, n={len(instances)})", pad=8,
+        f"(n={len(instances)})", pad=8,
     )
     ax3.legend(frameon=False, fontsize=8.5)
     _panel_label(ax3, "F2-a", x=-0.14)
