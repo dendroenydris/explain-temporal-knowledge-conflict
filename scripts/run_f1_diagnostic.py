@@ -371,7 +371,8 @@ def run_a1_filter(
 
 # ── F1-a: SAT Probe ─────────────────────────────────────────────────────────
 
-def run_f1a(model, b1_instances, template, out_dir, *, probe_c: float = 0.05):
+def run_f1a(model, b1_instances, template, out_dir, *, probe_c: float = 0.05,
+            external_ht: Optional[list[tuple[int, int]]] = None):
     """SAT Probe: logistic regression on attention-to-year features.
 
     After the probe (Steps 3–4), Step 5 computes the per-instance
@@ -413,17 +414,24 @@ def run_f1a(model, b1_instances, template, out_dir, *, probe_c: float = 0.05):
         print("    → F1 (attention to year tokens) may genuinely not be the mechanism")
 
     # ── Step 5: per-instance H_T-attention scalar + percentile sweep ─────────
-    ht_heads = fallback_temporal_heads(top_heads, top_k=3)
+    # Prefer validated (paper) H_T over the SAT-probe top-|coef| fallback.
+    if external_ht:
+        ht_heads = external_ht
+        is_fallback = False
+    else:
+        ht_heads = fallback_temporal_heads(top_heads, top_k=3)
+        is_fallback = True
     f1_pos = compute_f1_positive_instances(
         X, y, ht_heads,
         n_heads=model.cfg.n_heads,
         percentiles=(20, 25, 33),
         primary_percentile=25,
-        is_fallback=True,
+        is_fallback=is_fallback,
     )
     primary_mask = f1_pos.f1_positive_by_percentile[f1_pos.primary_percentile]
+    _ht_src = "validated (paper/manual)" if not is_fallback else "FALLBACK — top-3 by |coef|"
     print(
-        f"\nF1-a Step 5  (temporal-head FALLBACK — top-3 by |coef|): "
+        f"\nF1-a Step 5  (temporal-head {_ht_src}): "
         f"{ht_heads}"
     )
     print(
@@ -528,6 +536,7 @@ def run_f1b(
     out_dir,
     *,
     weak_label: str = "B3",
+    external_ht: Optional[list[tuple[int, int]]] = None,
 ):
     """Compare attention to year tokens: B1-success vs B1-failure vs B3/B6.
 
@@ -542,9 +551,13 @@ def run_f1b(
     print(f"F1-b: Attention Comparison (B1-success vs B1-failure vs {weak_label})")
     print("=" * 60)
 
-    if not top_heads:
+    head_set: Optional[list[tuple[int, int]]]
+    if external_ht:
+        head_set = external_ht
+        print(f"Analysing validated temporal heads (paper/manual): {head_set}")
+    elif not top_heads:
         print("No top heads from SAT probe. Using all heads.")
-        head_set: Optional[list[tuple[int, int]]] = None
+        head_set = None
     else:
         head_set = fallback_temporal_heads(top_heads, top_k=3)
         print(f"Analysing top-3 heads (temporal-head fallback): {head_set}")
@@ -965,6 +978,46 @@ def run_f1c(model, b1_instances, y_labels, top_heads, template, out_dir):
     return summary
 
 
+# ── External temporal-head loading ───────────────────────────────────────────
+
+def _select_temporal_heads_model(model_entries: dict, model_name: str, source: str) -> dict:
+    requested = model_name.lower()
+    requested_short = requested.rsplit("/", 1)[-1]
+    for key, entry in model_entries.items():
+        candidates = {
+            key.lower(),
+            str(entry.get("model", "")).lower(),
+            str(entry.get("model", "")).lower().rsplit("/", 1)[-1],
+        }
+        if requested in candidates or requested_short in candidates:
+            return entry
+    available = ", ".join(str(e.get("model", k)) for k, e in model_entries.items())
+    raise ValueError(
+        f"No temporal heads for model {model_name!r} in {source}. Available: {available}"
+    )
+
+
+def load_external_temporal_heads(
+    path: str, model_name: Optional[str], top_k: int = 10,
+) -> list[tuple[int, int]]:
+    """Load validated H_T from a paper/f1a JSON (handles both schemas)."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if "models" in data:
+        if not model_name:
+            raise ValueError(f"{path} groups heads by model; pass --model.")
+        data = _select_temporal_heads_model(data["models"], model_name, path)
+    heads: list[tuple[int, int]] = []
+    for entry in data.get("top_heads", [])[:top_k]:
+        coef = str(entry.get("coef", "0"))
+        if coef in ("0", "0.0000e+00"):
+            continue
+        heads.append((int(entry["layer"]), int(entry["head"])))
+    if not heads:
+        raise ValueError(f"No usable temporal heads in {path} for {model_name!r}.")
+    return heads
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1028,6 +1081,26 @@ def main():
             "the correct testbed for the F1 (Time Not Set) diagnostic.  Requires "
             "the JSONL file to contain B5 instances (build with --layers B1 B3 B5)."
         ),
+    )
+    parser.add_argument(
+        "--temporal-heads",
+        help=(
+            "Path to a temporal-heads JSON (e.g. "
+            "data/external/temporal_heads/paper_temporal_heads.json).  When "
+            "provided, H_T for F1-a Step 5 and F1-b is taken from this VALIDATED "
+            "set instead of the SAT-probe top-|coef| fallback (which is circular: "
+            "the probe's own heads anti-correlate with success, forcing F1-b "
+            "p≈1.0).  F1-c is unaffected (it knocks out attention to year tokens, "
+            "not specific heads)."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-heads-manual", nargs="+", metavar="L,H",
+        help="Manual temporal heads as layer,head pairs, e.g. 10,13 1,6 (overrides --temporal-heads).",
+    )
+    parser.add_argument(
+        "--temporal-heads-top-k", type=int, default=10,
+        help="How many heads to take from the temporal-heads JSON (default: 10 = all listed).",
     )
     args = parser.parse_args()
 
@@ -1100,12 +1173,29 @@ def main():
             print("\nNo instances remain after A1 filter. Exiting.")
             return
 
+    # Resolve external (validated) temporal heads for H_T.  Manual overrides file.
+    external_ht: Optional[list[tuple[int, int]]] = None
+    if args.temporal_heads_manual:
+        external_ht = []
+        for pair in args.temporal_heads_manual:
+            l_str, h_str = pair.split(",")
+            external_ht.append((int(l_str), int(h_str)))
+    elif args.temporal_heads:
+        external_ht = load_external_temporal_heads(
+            args.temporal_heads, args.model, top_k=args.temporal_heads_top_k,
+        )
+    if external_ht:
+        print(f"[H_T] Using validated temporal heads (paper/manual): {external_ht}")
+    else:
+        print("[H_T] No --temporal-heads given; falling back to SAT-probe top-|coef| "
+              "(WARNING: circular for F1-b — see --temporal-heads).")
+
     # F1-a
     probe_result, X, y, meta, f1_pos = None, None, None, None, None
     if "f1a" not in args.skip:
         probe_result, X, y, meta, f1_pos = run_f1a(
             model, b1_instances, args.template, out_dir,
-            probe_c=args.probe_c,
+            probe_c=args.probe_c, external_ht=external_ht,
         )
 
     top_heads_list = probe_result.top_heads if probe_result else []
@@ -1117,7 +1207,7 @@ def main():
             X, y, meta = collect_features(model, b1_instances, template=args.template)
         run_f1b(
             model, b1_instances, b3_instances, y, top_heads_list,
-            args.template, out_dir, weak_label=weak_label,
+            args.template, out_dir, weak_label=weak_label, external_ht=external_ht,
         )
 
     # F1-c
