@@ -24,6 +24,7 @@ Run from the ``code/`` directory (the cluster working dir).
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -50,6 +51,27 @@ from eap.attribute import attribute  # noqa: E402
 
 HEAD_RE = re.compile(r"^a(\d+)\.h(\d+)$")
 YEAR_RE = re.compile(r"(\d{4})")
+
+
+def _assert_eap_attribute_bf16_safe(dtype: str) -> None:
+    """Fail before model loading if the cluster imported an old EAP checkout."""
+    src_path = inspect.getsourcefile(attribute)
+    print(f"[preflight] eap.attribute source: {src_path}")
+    if dtype != "bfloat16":
+        return
+    try:
+        src = inspect.getsource(attribute)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot inspect eap.attribute at {src_path}; refusing bf16 EAP run"
+        ) from exc
+    if ".float().cpu().numpy()" not in src:
+        raise RuntimeError(
+            "The imported eap.attribute is not bf16-safe. It still appears to "
+            "convert scores with scores.cpu().numpy(), which fails for "
+            "bfloat16 tensors. Sync source/eap/attribute.py so attribute() uses "
+            "scores.float().cpu().numpy(), or rerun with DTYPE=float16/float32."
+        )
 
 
 # ──────────────────────────── dataset construction ──────────────────────────
@@ -284,6 +306,8 @@ def main() -> None:
                     help="disable use_split_qkv_input (try if a GQA model errors)")
     ap.add_argument("--skip-existing", action="store_true")
     args = ap.parse_args()
+
+    _assert_eap_attribute_bf16_safe(args.dtype)
 
     rng = Random(args.seed)
     data_dir = Path(args.data_dir)

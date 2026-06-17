@@ -31,6 +31,20 @@ command -v conda >/dev/null || { echo "[ERROR] conda not found" >&2; exit 1; }
 eval "$(conda shell.bash hook)"
 conda activate "${CONDA_ENV_NAME}"
 
+python - <<'PY'
+from pathlib import Path
+
+path = Path("source/eap/attribute.py")
+text = path.read_text()
+if "scores.float().cpu().numpy()" not in text:
+    raise SystemExit(
+        "[ERROR] source/eap/attribute.py is not bf16-safe. "
+        "Sync the latest file; attribute() must use "
+        "scores.float().cpu().numpy()."
+    )
+print(f"[OK] bf16-safe EAP attribute: {path.resolve()}")
+PY
+
 if [ -n "${HF_TOKEN:-}" ]; then
   export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 else
