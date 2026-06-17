@@ -117,12 +117,26 @@ python scripts/run_f2_diagnostic.py \
   "$@"
 
 python - <<PY
+import json
 from pathlib import Path
 
 out_dir = Path("${OUT_DIR}")
 outputs = sorted(out_dir.glob("*.json"))
 if not outputs:
     raise SystemExit(f"[ERROR] Stage 2 finished but no JSON outputs found in {out_dir}")
+
+verdict_path = out_dir / "f2_verdicts.json"
+if verdict_path.exists():
+    verdict = json.load(open(verdict_path))
+    schema = verdict.get("schema_version")
+    if schema != "f2_v2_dla_clean_verdict":
+        raise SystemExit(
+            "[ERROR] Stage 2 wrote an old/incompatible f2_verdicts.json schema "
+            f"({schema!r}). Make sure the cluster copy includes the latest "
+            "scripts/run_f2_diagnostic.py and source/tatm/f2_diagnosis.py."
+        )
+    print(f"[OK] F2 schema: {schema}")
+    print(f"[OK] F2 diagnosis source: {verdict.get('tatm_f2_diagnosis_path')}")
 
 print("[OK] Stage 2 outputs are ready:")
 for path in outputs:

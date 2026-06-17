@@ -181,38 +181,13 @@ def panel_b(ax: plt.Axes, data: dict) -> None:
     )
     ax.grid(axis="y", alpha=0.35, linestyle="--")
 
-    # ── B5 × B6 cells (primary F2 detector) ────────────────────────────────
-    cell_lines = [
-        ("B5-success ∩ B6-fail",   n_b5s_b6f, "anti-F2"),
-        ("B5-fail    ∩ B6-fail",   n_b5f_b6f, "candidate F2"),
-        ("B5-fail    ∩ B6-success", n_b5f_b6s, "paradoxical"),
-        ("B5-success ∩ B6-success", n_b5s_b6s, "year not needed"),
-    ]
-    box_text = "Per-instance B5×B6 cells (methodology lines 340–344):\n"
-    for label, n, tag in cell_lines:
-        pct = 100 * n / n_total if n_total else 0
-        box_text += f"  {label:<26s}  {n:>3d}/{n_total}  ({pct:4.1f}%)  — {tag}\n"
-
-    # 3-way disambiguation cells (methodology line 347)
-    disamb = data.get("b1xb5xb6_disambiguation") or {}
-    if disamb:
-        box_text += "\n3-way B1×B5×B6 disambiguation (methodology line 347):\n"
-        rows = [
-            ("B1f ∩ B5f ∩ B6f", disamb.get("n_b1f_b5f_b6f", 0), "PARAMETRIC DOMINANCE — not F2"),
-            ("B1f ∩ B5f ∩ B6s", disamb.get("n_b1f_b5f_b6s", 0), "year NOT required"),
-            ("B1f ∩ B5s ∩ B6f", disamb.get("n_b1f_b5s_b6f", 0), "YEAR-DRIVEN RESCUE — rules out F2"),
-            ("B1f ∩ B5s ∩ B6s", disamb.get("n_b1f_b5s_b6s", 0), "dual-ev. rescue regardless of year"),
-        ]
-        for label, n, tag in rows:
-            pct = 100 * n / n_total if n_total else 0
-            box_text += f"  {label:<26s}  {n:>3d}/{n_total}  ({pct:4.1f}%)  — {tag}\n"
-
-    box_text = box_text.rstrip()
     ax.text(
-        -0.18, -0.45, box_text,
-        transform=ax.transAxes, ha="left", va="top",
-        fontsize=8, family="monospace", color="#222222",
-        bbox=dict(boxstyle="round,pad=0.4", fc="#F4F4F8", ec="#CCCCCC", alpha=0.95),
+        0.02, 0.03,
+        (f"B5+B6-={n_b5s_b6f}   B5-B6+={n_b5f_b6s}   "
+         f"B5-B6-={n_b5f_b6f}"),
+        transform=ax.transAxes, ha="left", va="bottom",
+        fontsize=8, color="#222222",
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.90),
     )
 
     _panel_label(ax, "B")
@@ -404,7 +379,26 @@ def panel_regime(ax: plt.Axes, f2b_data: dict, verdict_data: dict | None) -> Non
     # Final verdict bar (F1-cross-referenced)
     if verdict_data is not None and verdict_data.get("verdict_counts"):
         bars_y.append("F2 verdict\n(DLA + F1-crossref)")
-        v_counts = verdict_data["verdict_counts"]
+        raw_counts = verdict_data["verdict_counts"]
+        v_counts = {k: 0 for k in [
+            "not_routing_failure", "F1", "F2", "F3_candidate",
+            "F2_unverified", "F3_candidate_unverified", "undetermined",
+        ]}
+        legacy_suffix_seen = False
+        for key, n in raw_counts.items():
+            norm = key
+            if norm.endswith("_f1b_nonsignif"):
+                legacy_suffix_seen = True
+                norm = norm.removesuffix("_f1b_nonsignif")
+            if norm.startswith(("F2_strong_unverified", "F2_weak_unverified")):
+                norm = "F2_unverified"
+            elif norm.startswith(("F2_strong", "F2_weak")):
+                norm = "F2"
+            elif norm.startswith("F3_candidate_unverified"):
+                norm = "F3_candidate_unverified"
+            elif norm.startswith("F3_candidate"):
+                norm = "F3_candidate"
+            v_counts[norm if norm in v_counts else "undetermined"] += n
         n_v = sum(v_counts.values()) or 1
         # Collapsed labels: F2-strong/F2-weak → "F2"; f1b is a separate boolean
         # (no longer a verdict suffix).  Order: not_routing_failure → F1 → F2 → F3.
@@ -432,6 +426,13 @@ def panel_regime(ax: plt.Axes, f2b_data: dict, verdict_data: dict | None) -> Non
                         ha="center", va="center", fontsize=8,
                         color="white", fontweight="bold")
             left += n / n_v * 100
+        if legacy_suffix_seen:
+            ax.text(
+                0.99, 0.02,
+                "Note: legacy _f1b_nonsignif suffixes collapsed for plotting",
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=7.5, color=C_GRAY,
+            )
 
     ax.set_yticks(range(len(bars_y)))
     ax.set_yticklabels(bars_y, fontsize=9)
@@ -558,12 +559,25 @@ def panel_summary(ax: plt.Axes, f2b_data: dict, f2c_data: dict) -> None:
     mc = f2c_data.get("mcnemar_b5_vs_b6")
     if mc:
         lines.append("F2-c McNemar (PRIMARY; B5 vs B6, paired):")
-        lines.append(f"  b(B5✓B6✗)={mc.get('b_b5success_b6fail','?')}  "
-                     f"c(B5✗B6✓)={mc.get('c_b5fail_b6success','?')}  "
+        lines.append(f"  b(B5+B6-)={mc.get('b_b5success_b6fail','?')}  "
+                     f"c(B5-B6+)={mc.get('c_b5fail_b6success','?')}  "
                      f"(odds {mc.get('odds_b_over_c',float('nan')):.1f}×)")
         if mc.get("chi2") is not None:
             lines.append(f"  χ²(cont.)={mc['chi2']:.2f}  p_exact={mc['p_exact']:.3g}  "
                          f"(prefer {mc.get('prefer','?')})")
+    else:
+        primary = f2c_data.get("b5xb6_primary")
+        if primary:
+            lines.append("F2-c paired behavior (legacy schema):")
+            lines.append(f"  B5+B6-={primary.get('n_b5_success_b6_fail','?')}  "
+                         f"B5-B6+={primary.get('n_b5_fail_b6_success','?')}  "
+                         f"B5-B6-={primary.get('n_b5_fail_b6_fail','?')}")
+            lines.append(f"  B5 accuracy={100*f2c_data.get('b5_accuracy',0):.1f}%  "
+                         f"B6 accuracy={100*f2c_data.get('b6_accuracy',0):.1f}%")
+            disamb = f2c_data.get("b1xb5xb6_disambiguation") or {}
+            if disamb:
+                lines.append(f"  B1f∩B5f∩B6f among B1f∩B5f: "
+                             f"{100*disamb.get('rate_parametric_dominance_in_b1f_b5f',0):.1f}%")
 
     ax.text(0.0, 1.0, "\n".join(lines), transform=ax.transAxes,
             ha="left", va="top", fontsize=9, family="monospace", color="#222222",
@@ -606,14 +620,14 @@ def main():
     #   row1: C STR recov. | D trajectories (descriptive)
     #   row2: DLA (primary)| S summary (coverage/DLA/McNemar)
     #   row3: E verdict distribution (full-width)
-    fig = plt.figure(figsize=(14, 17))
+    fig = plt.figure(figsize=(14, 19))
     gs  = gridspec.GridSpec(
         4, 2,
         figure=fig,
-        hspace=0.65,
+        hspace=1.00,
         wspace=0.38,
         left=0.07, right=0.97,
-        top=0.94,  bottom=0.06,
+        top=0.94,  bottom=0.08,
         height_ratios=[1.0, 1.0, 1.0, 0.7],
     )
 

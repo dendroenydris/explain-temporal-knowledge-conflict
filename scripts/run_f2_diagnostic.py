@@ -45,6 +45,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import random as _random
 import sys
@@ -78,6 +79,8 @@ from tatm.model import (
     generate_answer,
     load_model,
 )
+
+F2_OUTPUT_SCHEMA_VERSION = "f2_v2_dla_clean_verdict"
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -553,6 +556,8 @@ def run_f2b(
           f"({100*coverage:5.1f}%)  (rank-competitive before final layer)")
 
     output = {
+        "schema_version": F2_OUTPUT_SCHEMA_VERSION,
+        "tatm_f2_diagnosis_path": inspect.getsourcefile(compute_route_scores),
         "l_t": l_t,
         "l_t_mode": l_t_mode,
         "lens_kind": lens_kind,
@@ -714,6 +719,8 @@ def run_f2c(
         print("\n  → B5 ≈ B6: model does NOT use year token in evidence to route.")
 
     output = {
+        "schema_version": F2_OUTPUT_SCHEMA_VERSION,
+        "tatm_f2_diagnosis_path": inspect.getsourcefile(behavioral_cross_analysis),
         "n_total": n,
         "b1_accuracy": result.b1_accuracy,
         "b5_accuracy": result.b5_accuracy,
@@ -876,9 +883,9 @@ def main():
             "Optional path to F1-b output JSON (typically "
             "results2/f1_diagnostic_1000_<tag>/f1b_attention_comparison.json).  When "
             "provided, the population-level Mann-Whitney p-value is read "
-            "and every F2 verdict is suffixed with ``_f1b_nonsignif`` if "
-            "F1-b fails to confirm the 'Time Set' population premise "
-            "(methodology line 284)."
+            "and recorded as the boolean ``f1b_nonsignif`` if F1-b fails "
+            "to confirm the old population premise. It does not alter the "
+            "clean verdict label."
         ),
     )
     parser.add_argument(
@@ -1117,8 +1124,8 @@ def main():
                       f"{args.f1_results} — proceeding without F1-a cross-reference. "
                       f"Reason: {exc}")
 
-        # F1-b population consistency (methodology line 284): if F1-b is
-        # non-significant, every F2 verdict is annotated with ``_f1b_nonsignif``.
+        # F1-b population consistency: if F1-b is non-significant, keep a soft
+        # boolean annotation. Do not alter the clean verdict label.
         f1b_consistency: dict | None = None
         if args.f1b_results:
             try:
@@ -1135,8 +1142,8 @@ def main():
                 else:
                     print(f"\n[F1-b consistency] WARNING: Mann-Whitney p={p:.4g} "
                           f"≥ α={args.f1b_alpha} — F1-b does NOT confirm the "
-                          "'Time Set' population premise; every F2/F3 verdict "
-                          "below is suffixed ``_f1b_nonsignif``.")
+                          "'Time Set' population premise; recording soft "
+                          "f1b_nonsignif=True without changing verdict labels.")
             except Exception as exc:
                 print(f"\n[F1-b consistency] WARNING: failed to load "
                       f"{args.f1b_results} ({exc}); consistency check skipped.")
@@ -1178,6 +1185,11 @@ def main():
                   "(premise now carried by F2-c McNemar, not F1-b).")
 
         verdict_output = {
+            "schema_version": F2_OUTPUT_SCHEMA_VERSION,
+            "tatm_f2_diagnosis_path": inspect.getsourcefile(assign_f2_verdicts),
+            "verdict_label_policy": (
+                "clean labels only; f1b_nonsignif is a separate boolean field"
+            ),
             "n": len(verdicts),
             "f1_results_path":  args.f1_results,
             "f1_percentile":    args.f1_percentile if args.f1_results else None,
