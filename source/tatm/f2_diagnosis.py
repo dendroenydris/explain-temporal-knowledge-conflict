@@ -550,7 +550,7 @@ def compute_temporal_head_dla(
             normed = head_out / scale
             if gamma is not None:
                 normed = normed * gamma
-            contrib = float(normed @ dir_vec)
+            contrib = float((normed @ dir_vec).detach())
             per_head[f"{l}.{h}"] = contrib
             total += contrib
         del cache
