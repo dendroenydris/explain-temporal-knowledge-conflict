@@ -49,6 +49,7 @@ import torch
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
 
+from tatm.f2_diagnosis import compute_head_dla
 from tatm.logit_lens import LogitTrajectory, run_logit_lens
 from tatm.model import (
     _clean_generated,
@@ -128,6 +129,21 @@ F3C_CLOSED_BOOK_DETECT_MIN = 0.50
 #: F3-c Step 4 top-k for vocab projection (line 643).
 F3C_TOP_K_VOCAB            = 10
 
+# ── F3 spine: crystallization-robust head-ablation verdict (Changes 3/5/6) ───
+#: Candidate override-head pool = layers ``l > 2L/3`` (late attention pool).
+F3_HEAD_POOL_FRAC          = (2, 3)
+#: Default number of cohort-top-k DLA heads ablated on the spine.
+F3_HEAD_TOPK_DEFAULT       = 4
+#: Power floor on the OVERRIDE claim (clean F3 cohort) — Finding 9.3 / Change 5.
+F3_CLEAN_F3_MIN            = 15
+#: ``lens_decodable_fraction`` below this ⇒ ``lens_na`` (trajectory metrics +
+#: appendix span-knockout suppressed; the causal head-ablation spine still runs).
+F3_LENS_NA_FRACTION        = 0.10
+#: Per-instance lens-decodability: answer_new becomes rank-competitive at a
+#: layer strictly before the final layer (calibration-free, crystallization-aware).
+#: New one-directional, timeline-confirmed param taxonomy (Finding 0 / Change 0).
+PARAM_CLASSES              = ("TEMPORAL_STALE_CONFIRMED", "PARAM_AMBIGUOUS", "PARAM_NEW")
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Prepared instance + Layer-3 / Layer-4 IO
 # ═════════════════════════════════════════════════════════════════════════════
@@ -138,11 +154,17 @@ class F3PreparedInstance:
     """B1 instance enriched with the F3 fields required by methodology L364+.
 
     ``a_param`` is **the A1(t_new) parametric answer** (methodology line 365).
-    ``param_class`` is one of ``"PARAM_OLD"`` (``a_param == answer_old``),
-    ``"PARAM_OTHER"`` (``a_param`` neither old nor new), or
-    ``"PARAM_NEW"`` (``a_param == answer_new``).  PARAM_NEW is the
-    closed-book control population that F3-a / F3-c use as the
-    matched-stratum success comparator.
+    ``param_class`` is one of (Finding 0 / Change 0 — one-directional taxonomy):
+
+    * ``"PARAM_NEW"`` — ``a_param == answer_new`` (first-token negative control).
+    * ``"TEMPORAL_STALE_CONFIRMED"`` — ``a_param`` matches the recorded
+      ``answer_old`` OR any pre-``t_new`` timeline primary object; provably
+      once-true.  Reported as a one-directional LOWER BOUND only.
+    * ``"PARAM_AMBIGUOUS"`` — neither new nor confirmed-stale (unrecorded-stale
+      OR hallucination).  NEVER used as a not-stale control.
+
+    ``stale_exact`` is True only when ``a_param`` matched the exact recorded
+    ``answer_old`` (kept for transparency, not for any contrast).
     """
 
     instance_id: str
@@ -153,7 +175,8 @@ class F3PreparedInstance:
     a_param: str
     answer_new_tid: int
     a_param_tid: int
-    param_class: str                # PARAM_OLD / PARAM_OTHER / PARAM_NEW
+    param_class: str                # TEMPORAL_STALE_CONFIRMED / PARAM_AMBIGUOUS / PARAM_NEW
+    stale_exact: bool = False       # matched the exact recorded answer_old
 
     # B1 behavioural label (filled in by classify_b1_behavior or Layer-4)
     b1_success: Optional[bool] = None        # True ↔ B1-success (output = answer_new)
@@ -216,12 +239,85 @@ def _classify_param(
     a_param: str,
     answer_new: str,
     answer_old: str,
-) -> str:
+    *,
+    stale_objects: Optional[Sequence[str]] = None,
+) -> tuple[str, bool]:
+    """One-directional, timeline-confirmed temporal-stale classification.
+
+    Returns ``(param_class, stale_exact)``.  The contaminated
+    PARAM_OLD-vs-PARAM_OTHER contrast is retired (Finding 0): only the
+    positive, provably-once-true class is asserted, as a LOWER BOUND.
+    Incompleteness of the DB / timeline can only cause misses (low recall),
+    never false confirmations (precision is safe by construction).
+    """
     if check_match(a_param, answer_new):
-        return "PARAM_NEW"
-    if check_match(a_param, answer_old):
-        return "PARAM_OLD"
-    return "PARAM_OTHER"
+        return "PARAM_NEW", False
+    if answer_old and check_match(a_param, answer_old):
+        return "TEMPORAL_STALE_CONFIRMED", True
+    if stale_objects:
+        for obj in stale_objects:
+            if obj and check_match(a_param, obj):
+                return "TEMPORAL_STALE_CONFIRMED", False
+    return "PARAM_AMBIGUOUS", False
+
+
+def load_timelines(path: str) -> dict[str, Any]:
+    """Load ``{fact_id: FactTimeline}`` from a Layer-1 timeline JSONL.
+
+    Used by :func:`prepare_f3_instances` to build the confirmed-stale set
+    (Change 0).  Returns an empty dict on any load failure so the caller
+    falls back to single-``answer_old`` confirmation.
+    """
+    import json
+
+    try:
+        from fact_timeline.models import FactTimeline
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [F3] could not import FactTimeline ({exc}); "
+              "confirmed-stale falls back to single answer_old.")
+        return {}
+    out: dict[str, Any] = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                tl = FactTimeline.from_dict(json.loads(line))
+            except Exception:  # noqa: BLE001 — skip malformed rows
+                continue
+            if tl.fact_id:
+                out[tl.fact_id] = tl
+    return out
+
+
+def _confirmed_stale_objects(timeline: Any, t_new: Any, answer_new: str) -> list[str]:
+    """Primary object per year strictly before ``t_new``, minus answer_new.
+
+    Uses ``primary_object_for_year`` (not all ``objects``) to keep precision
+    high (Change 0): a match proves the value was once true; spurious
+    alias / co-listed matches are avoided.
+    """
+    if timeline is None or t_new is None:
+        return []
+    try:
+        tnew_int = int(t_new)
+    except (TypeError, ValueError):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in getattr(timeline, "states", []):
+        try:
+            year = int(s.year)
+        except (TypeError, ValueError):
+            continue
+        if year >= tnew_int:
+            continue
+        obj = timeline.primary_object_for_year(year)
+        if obj and obj not in seen:
+            seen.add(obj)
+            out.append(obj)
+    return [o for o in out if not check_match(o, answer_new)]
 
 
 def prepare_f3_instances(
@@ -229,10 +325,19 @@ def prepare_f3_instances(
     b1_rows: list[dict],
     layer3_by_id: dict[str, dict],
     layer3_by_key: dict[tuple, dict],
+    *,
+    timelines: Optional[dict[str, Any]] = None,
 ) -> list[F3PreparedInstance]:
-    """Join Layer-2 B1 rows with Layer-3 parametric answers."""
+    """Join Layer-2 B1 rows with Layer-3 parametric answers.
+
+    When ``timelines`` is provided (Change 0) the parametric class uses the
+    one-directional, timeline-confirmed temporal-stale lower bound; otherwise
+    confirmation falls back to the single recorded ``answer_old`` (a valid,
+    smaller lower bound; backwards-compatible).
+    """
     prepared: list[F3PreparedInstance] = []
     skipped = {"no_layer3": 0, "bad_token": 0, "duplicate_token": 0}
+    n_missing_timeline = 0
     for row in b1_rows:
         iid = str(row.get("instance_id", ""))
         l3 = layer3_by_id.get(iid)
@@ -255,11 +360,20 @@ def prepare_f3_instances(
         # Multi-token first-token collision (methodology line 626) is reported
         # but does not drop the instance — the Step-4 multi-token handling
         # branch picks it up via the first-token-distinctness diagnostic.
-        param_class = _classify_param(a_param, answer_new, answer_old)
+        fid = str(row.get("fact_id", ""))
+        timeline = timelines.get(fid) if timelines else None
+        if timelines is not None and timeline is None:
+            n_missing_timeline += 1
+        stale_objects = _confirmed_stale_objects(
+            timeline, row.get("t_new"), answer_new,
+        )
+        param_class, stale_exact = _classify_param(
+            a_param, answer_new, answer_old, stale_objects=stale_objects,
+        )
 
         prepared.append(F3PreparedInstance(
             instance_id=iid,
-            fact_id=str(row.get("fact_id", "")),
+            fact_id=fid,
             row=row,
             answer_new=answer_new,
             answer_old=answer_old,
@@ -267,10 +381,14 @@ def prepare_f3_instances(
             answer_new_tid=new_tid,
             a_param_tid=a_param_tid,
             param_class=param_class,
+            stale_exact=stale_exact,
         ))
     if any(skipped.values()):
         parts = [f"{k}={v}" for k, v in skipped.items() if v]
         print(f"  [F3] prepare skipped: {', '.join(parts)}")
+    if timelines is not None and n_missing_timeline:
+        print(f"  [F3] timeline missing for {n_missing_timeline} fact(s); "
+              "confirmed-stale fell back to single answer_old for those rows.")
     return prepared
 
 
@@ -468,6 +586,8 @@ class F3aTrajectoryResult:
     rank_new_final: int = -1
     # Behavioral anchor (filled from b1_outputs_param; the F3 classifier).
     b1_outputs_param: Optional[bool] = None
+    # Timeline-confirmed exact-stale sub-flag (Change 0; transparency only).
+    stale_exact: bool = False
 
 
 def _trajectory_delta(
@@ -633,6 +753,7 @@ def run_f3a_trajectory(
             first_rank_competitive_layer=first_rc,
             rank_new_final=rank_new_final,
             b1_outputs_param=inst.b1_outputs_param,
+            stale_exact=inst.stale_exact,
         ))
 
         bar.set_postfix(traj=is_f3, ok=len(results))
@@ -674,7 +795,11 @@ def classify_failure_mode(
     """
     if r.b1_success:
         return "SUCCESS"
-    if r.b1_outputs_param:
+    # F3 requires the model to have emitted a_param AND answer_new to have been
+    # genuinely suppressed (rank_new_final != 0).  Without the rank guard the
+    # PARAM_NEW first-token collisions (answer_new actually won, rank 0) inflate
+    # the F3 cohort (Finding 1 / Change 1).
+    if r.b1_outputs_param and r.rank_new_final != 0:
         return "F3"
     routed = r.first_rank_competitive_layer >= 0
     if not routed:
@@ -687,15 +812,23 @@ def classify_failure_mode(
 @dataclass
 class FailureModeSummary:
     """Population-level F1/F2/F3/MIXED distribution + F3 mechanism hit-rate."""
-    counts: dict             # {mode: n}
+    counts: dict             # {mode: n} — corrected (rank-guarded) classifier
     rates: dict              # {mode: fraction of failures}
     n_failures: int
     # Among the behavioral F3 cohort (b1_outputs_param), the fraction that
     # ALSO show the late rise-then-drop suppression signature.  This is the
     # numerator of the F3 mechanism claim (methodology F3-a).
     f3_mechanism_hit_rate: Optional[float]
-    f3_cohort_n: int
+    f3_cohort_n: int                  # = clean F3 cohort n (rank-guarded)
     counts_by_param_class: dict  # {param_class: {mode: n}}
+    # Transparency (Finding 1 / Change 1): the OLD (pre-rank-guard) F3 count
+    # — every B1-failure with ``b1_outputs_param`` — vs the corrected clean count.
+    counts_f3_raw: int = 0
+    behavioral_f3_rate: float = 0.0        # raw / n_failures
+    behavioral_f3_rate_clean: float = 0.0  # clean / n_failures
+    # rank_new_final == 0 (answer_new actually won) yet B1 scored a failure ⇒
+    # a possible RougeL b1_success threshold issue (investigate separately).
+    n_b1_scoring_suspect: int = 0
 
 
 def summarize_failure_modes(
@@ -707,8 +840,10 @@ def summarize_failure_modes(
     counts: dict[str, int] = {}
     by_class: dict[str, dict[str, int]] = {}
     f3_total = 0
+    f3_raw_total = 0
     f3_with_mechanism = 0
     n_failures = 0
+    n_suspect = 0
     for r in results:
         mode = classify_failure_mode(r, rank_thr=rank_thr)
         if mode == "SUCCESS":
@@ -717,10 +852,16 @@ def summarize_failure_modes(
         counts[mode] = counts.get(mode, 0) + 1
         cls = by_class.setdefault(r.param_class, {})
         cls[mode] = cls.get(mode, 0) + 1
+        # Raw (pre-rank-guard) F3: every B1-failure that emitted a_param.
+        if r.b1_outputs_param:
+            f3_raw_total += 1
         if mode == "F3":
             f3_total += 1
             if r.is_suppression:
                 f3_with_mechanism += 1
+        # answer_new won (rank 0) yet scored a failure ⇒ scoring suspect.
+        if r.rank_new_final == 0 and r.b1_success is False:
+            n_suspect += 1
     rates = {k: (v / n_failures if n_failures else 0.0) for k, v in counts.items()}
     hit_rate = (f3_with_mechanism / f3_total) if f3_total else None
     return FailureModeSummary(
@@ -730,6 +871,10 @@ def summarize_failure_modes(
         f3_mechanism_hit_rate=hit_rate,
         f3_cohort_n=f3_total,
         counts_by_param_class=by_class,
+        counts_f3_raw=f3_raw_total,
+        behavioral_f3_rate=(f3_raw_total / n_failures if n_failures else 0.0),
+        behavioral_f3_rate_clean=(f3_total / n_failures if n_failures else 0.0),
+        n_b1_scoring_suspect=n_suspect,
     )
 
 
@@ -934,6 +1079,203 @@ def run_f3_late_window_intervention(
     return results, summaries
 
 
+# ── F3 causal SPINE: DLA-localized late-head ablation (Changes 2, 3, 10) ────
+
+
+@dataclass
+class F3HeadAblationResult:
+    """Crystallization-robust F3 verdict carrier (Findings 9.1, 10).
+
+    Ablate the cohort-top-k DLA-localized late override heads and read the
+    GRADED change in the final logit diff ``logit(a_param) − logit(answer_new)``
+    on the clean F3 cohort vs a B1-success population null.  A positive
+    per-instance ``effect`` = ablation reduced the parametric advantage;
+    ``delta = mean(effect_failure) − mean(effect_success)`` with a CI excluding
+    0 ⇒ ``F3_supported`` (Finding 12.2).
+    """
+    n_clean_f3: int
+    n_success_null: int
+    head_pool_size: int
+    top_k: int
+    top_k_heads: list[tuple[int, int]]
+    per_head_dla: dict[str, float]          # cohort-mean DLA per "l.h" (top-k)
+    effect_failure_mean: float
+    effect_success_mean: float
+    delta: float
+    delta_CI: tuple[float, float]
+    failure_effects: list[float] = field(repr=False, default_factory=list)
+    success_effects: list[float] = field(repr=False, default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+def _late_head_pool(model: HookedTransformer) -> list[tuple[int, int]]:
+    """Candidate override-head pool: all heads in layers ``l > 2L/3``."""
+    n_layers = model.cfg.n_layers
+    n_heads = model.cfg.n_heads
+    lo = (n_layers * F3_HEAD_POOL_FRAC[0]) // F3_HEAD_POOL_FRAC[1]
+    return [(l, h) for l in range(lo + 1, n_layers) for h in range(n_heads)]
+
+
+def _ablation_effect(
+    model: HookedTransformer,
+    inst: F3PreparedInstance,
+    heads_by_layer: dict[int, list[int]],
+    *,
+    template: str,
+) -> Optional[float]:
+    """Per-instance graded effect = clean_logit_diff − ablated_logit_diff.
+
+    ``logit_diff = logit(a_param) − logit(answer_new)``.  Positive effect ⇒
+    ablating the heads reduced the parametric advantage (override evidence).
+    """
+    prompt = build_prompt(
+        str(inst.row.get("context", "")), str(inst.row.get("question", "")),
+        template=template,
+    )
+    tokens = model.to_tokens(prompt, prepend_bos=False)
+    targets = [inst.a_param_tid, inst.answer_new_tid]
+    clean_logits, _ = _final_logits_with_hooks(model, tokens, targets, hooks=[])
+    abl_hooks = _make_head_ablation_hooks(heads_by_layer, protocol="Z")
+    abl_logits, _ = _final_logits_with_hooks(model, tokens, targets, hooks=abl_hooks)
+    clean_diff = float(clean_logits[0] - clean_logits[1])
+    abl_diff = float(abl_logits[0] - abl_logits[1])
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return clean_diff - abl_diff
+
+
+def _diff_means_CI(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    n_resamples: int = F3B_BOOTSTRAP_N,
+    rng: Optional[np.random.Generator] = None,
+) -> tuple[float, tuple[float, float]]:
+    """Bootstrap CI for ``mean(a) − mean(b)`` (two independent samples)."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.size == 0:
+        return 0.0, (0.0, 0.0)
+    point = float(a.mean() - (b.mean() if b.size else 0.0))
+    samples = np.empty(n_resamples)
+    for i in range(n_resamples):
+        am = a[rng.integers(0, a.size, a.size)].mean()
+        bm = b[rng.integers(0, b.size, b.size)].mean() if b.size else 0.0
+        samples[i] = am - bm
+    return point, (float(np.percentile(samples, 2.5)),
+                   float(np.percentile(samples, 97.5)))
+
+
+def run_f3_head_ablation(
+    model: HookedTransformer,
+    clean_f3: Sequence[F3PreparedInstance],
+    success_null: Sequence[F3PreparedInstance],
+    *,
+    template: str = "phi3",
+    top_k: int = F3_HEAD_TOPK_DEFAULT,
+    seed: int = 0,
+    verbose: bool = True,
+) -> F3HeadAblationResult:
+    """F3 spine: localize late override heads via DLA, then ablate + measure Δ.
+
+    1. Compute per-head DLA onto ``(a_param − answer_new)`` over the late pool
+       (``l > 2L/3``) for every clean-F3 instance; take the cohort-level top-k
+       ``(l,h)`` by mean DLA (localization only — NOT the verdict, Finding 9.1).
+    2. Ablate exactly those heads (zero ``hook_z`` at the last position) on every
+       clean-F3 AND B1-success-null instance; read the graded logit-diff effect.
+    3. Verdict effect ``delta = mean(effect_failure) − mean(effect_success)``
+       with a bootstrap CI (between-population, same perturbation — subsumes the
+       Finding 2 early/mid-null fix).
+    """
+    notes: list[str] = []
+    pool = _late_head_pool(model)
+    if not clean_f3:
+        notes.append("no_clean_f3")
+        return F3HeadAblationResult(
+            n_clean_f3=0, n_success_null=len(success_null),
+            head_pool_size=len(pool), top_k=top_k, top_k_heads=[],
+            per_head_dla={}, effect_failure_mean=0.0, effect_success_mean=0.0,
+            delta=0.0, delta_CI=(0.0, 0.0), notes=notes,
+        )
+
+    # ── 1. DLA localization (cohort-mean over the clean F3 cohort) ──────────
+    dla_sums: dict[str, float] = {}
+    dla_counts: dict[str, int] = {}
+    bar = tqdm(clean_f3, desc="F3 spine DLA localize", disable=not verbose,
+               unit="inst", dynamic_ncols=True)
+    for inst in bar:
+        prompt = build_prompt(
+            str(inst.row.get("context", "")), str(inst.row.get("question", "")),
+            template=template,
+        )
+        tokens = model.to_tokens(prompt, prepend_bos=False)
+        per_head, _ = compute_head_dla(
+            model, tokens, pool, inst.a_param_tid, inst.answer_new_tid,
+        )
+        for key, val in per_head.items():
+            dla_sums[key] = dla_sums.get(key, 0.0) + val
+            dla_counts[key] = dla_counts.get(key, 0) + 1
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    bar.close()
+
+    if not dla_sums:
+        notes.append("dla_failed_on_all_instances")
+        return F3HeadAblationResult(
+            n_clean_f3=len(clean_f3), n_success_null=len(success_null),
+            head_pool_size=len(pool), top_k=top_k, top_k_heads=[],
+            per_head_dla={}, effect_failure_mean=0.0, effect_success_mean=0.0,
+            delta=0.0, delta_CI=(0.0, 0.0), notes=notes,
+        )
+
+    mean_dla = {k: dla_sums[k] / max(1, dla_counts[k]) for k in dla_sums}
+    ranked = sorted(mean_dla.items(), key=lambda kv: kv[1], reverse=True)
+    top = ranked[:top_k]
+    top_k_heads = [(int(k.split(".")[0]), int(k.split(".")[1])) for k, _ in top]
+    per_head_dla = {k: v for k, v in top}
+    heads_by_layer: dict[int, list[int]] = {}
+    for (l, h) in top_k_heads:
+        heads_by_layer.setdefault(l, []).append(h)
+
+    # ── 2. Ablate the SAME heads on both arms; read graded logit-diff ──────
+    failure_effects: list[float] = []
+    for inst in tqdm(clean_f3, desc="F3 spine ablate (failure)",
+                     disable=not verbose, unit="inst", dynamic_ncols=True):
+        eff = _ablation_effect(model, inst, heads_by_layer, template=template)
+        if eff is not None:
+            failure_effects.append(eff)
+    success_effects: list[float] = []
+    for inst in tqdm(success_null, desc="F3 spine ablate (B1-success null)",
+                     disable=not verbose, unit="inst", dynamic_ncols=True):
+        eff = _ablation_effect(model, inst, heads_by_layer, template=template)
+        if eff is not None:
+            success_effects.append(eff)
+
+    if not success_effects:
+        notes.append("empty_success_null — Δ falls back to failure-only mean (no between-pop CI)")
+    fa = np.asarray(failure_effects, dtype=float)
+    sa = np.asarray(success_effects, dtype=float)
+    delta, ci = _diff_means_CI(fa, sa, rng=np.random.default_rng(seed))
+
+    return F3HeadAblationResult(
+        n_clean_f3=len(clean_f3),
+        n_success_null=len(success_null),
+        head_pool_size=len(pool),
+        top_k=top_k,
+        top_k_heads=top_k_heads,
+        per_head_dla=per_head_dla,
+        effect_failure_mean=float(fa.mean()) if fa.size else 0.0,
+        effect_success_mean=float(sa.mean()) if sa.size else 0.0,
+        delta=delta,
+        delta_CI=ci,
+        failure_effects=failure_effects,
+        success_effects=success_effects,
+        notes=notes,
+    )
+
+
 # ── F3-a population-level summary + positive-control verdict ────────────────
 
 
@@ -963,150 +1305,111 @@ def _cramer_v_2x2(matrix: np.ndarray) -> float:
     return float(math.sqrt(chi2 / n))  # min(k-1) = 1 for 2×2
 
 
+def _is_lens_decodable(r: "F3aTrajectoryResult") -> bool:
+    """Per-instance lens decodability (Change 6 / Finding 3).
+
+    The raw logit lens can read answer_new's trajectory iff it becomes
+    rank-competitive at a layer strictly before the final layer.  On
+    high-crystallization models the answer only resolves at the very last
+    layer, so this fraction collapses (Phi-3 ~6%) and ``lens_na`` trips.
+    """
+    frc = r.first_rank_competitive_layer
+    return frc >= 0 and frc < (r.n_layers - 1)
+
+
 @dataclass
 class F3aSummary:
-    """Population-level F3-a summary (methodology lines 405–414)."""
+    """Population-level F3-a summary (lean, descriptive — Change 6 / Finding 0-4).
+
+    The contaminated PARAM_OLD-vs-PARAM_OTHER positive-control lattice is
+    retired (Finding 0/4).  What remains is descriptive (per-class trajectory /
+    suppression) plus two spine-relevant scalars: ``lens_decodable_fraction``
+    (gates the lens trajectory readout) and ``confirmed_stale_fraction`` (a
+    one-directional LOWER BOUND over the clean F3 cohort).
+    """
     tau: float
     n_layers: int
     mid_window: tuple[int, int]
     late_window: tuple[int, int]
     counts_by_class: dict[str, int]
-    f3_traj_rate: dict[str, float]
+    f3_traj_rate: dict[str, float]                # descriptive (lens_na-gated)
     median_late_drop: dict[str, float]
-    align_HT_rate: dict[str, Optional[float]]   # None if ell_HT not provided
-    align_R_rate:  dict[str, Optional[float]]
-    cramer_v_fail_vs_success: float
-    param_old_over_param_other_pp: float
-    positive_control: dict[str, bool]
-    reading: str  # one of the asymmetric-reading verdict strings
+    suppression_mean_by_class: dict[str, float]   # descriptive (Finding 4)
+    lens_decodable_fraction: float                # Change 6 / Finding 3
+    confirmed_stale_fraction: float               # LOWER BOUND over clean F3
+    n_clean_f3: int                               # rank-guarded override cohort
     sweep_traj_rate: dict[str, dict[str, float]]  # {tau: {class: rate}}
 
 
 def summarize_f3a_population(
     results: Sequence[F3aTrajectoryResult],
     *,
-    ell_HT: Optional[int],
-    ell_R: Optional[int],
     tau: float = F3A_DEFAULT_TAU,
+    rank_thr: int = F3A_RANK_COMPETITIVE,
 ) -> F3aSummary:
-    """Aggregate F3-a results into the positive-control table (line 405)."""
+    """Aggregate F3-a results into the lean descriptive summary (Change 6).
+
+    No positive-control lattice, no OLD-vs-OTHER asymmetry, no Cramér's V —
+    those relied on the contaminated PARAM_OTHER control (Finding 0/4).
+    Trajectory / suppression are reported per class descriptively; the two
+    spine scalars are ``lens_decodable_fraction`` and the one-directional
+    ``confirmed_stale_fraction`` over the clean F3 cohort.
+    """
+    classes = list(PARAM_CLASSES)
     if not results:
-        empty = {"PARAM_OLD": 0, "PARAM_OTHER": 0, "PARAM_NEW": 0}
+        empty = {c: 0 for c in classes}
         return F3aSummary(
             tau=tau, n_layers=0, mid_window=(0, 0), late_window=(0, 0),
             counts_by_class=empty,
-            f3_traj_rate={k: 0.0 for k in empty},
-            median_late_drop={k: 0.0 for k in empty},
-            align_HT_rate={k: None for k in empty},
-            align_R_rate ={k: None for k in empty},
-            cramer_v_fail_vs_success=0.0,
-            param_old_over_param_other_pp=0.0,
-            positive_control={},
-            reading="no_data",
-            sweep_traj_rate={f"tau_{t:.2f}": {k: 0.0 for k in empty} for t in F3A_TAU_SWEEP},
+            f3_traj_rate={c: 0.0 for c in classes},
+            median_late_drop={c: 0.0 for c in classes},
+            suppression_mean_by_class={c: 0.0 for c in classes},
+            lens_decodable_fraction=0.0,
+            confirmed_stale_fraction=0.0,
+            n_clean_f3=0,
+            sweep_traj_rate={f"tau_{t:.2f}": {c: 0.0 for c in classes}
+                             for t in F3A_TAU_SWEEP},
         )
 
     n_layers = results[0].n_layers
-    k_align = alignment_k(n_layers)
-    classes = ["PARAM_OLD", "PARAM_OTHER", "PARAM_NEW"]
-
     by_class: dict[str, list[F3aTrajectoryResult]] = {c: [] for c in classes}
     for r in results:
         by_class.setdefault(r.param_class, []).append(r)
 
     counts = {c: len(by_class.get(c, [])) for c in classes}
     traj_rate = {
-        c: float(np.mean([int(r.is_f3_trajectory) for r in by_class.get(c, [])]))
-        if by_class.get(c) else 0.0
+        c: (float(np.mean([int(r.is_f3_trajectory) for r in by_class.get(c, [])]))
+            if by_class.get(c) else 0.0)
         for c in classes
     }
     median_drop = {
-        c: float(np.median([r.late_drop for r in by_class.get(c, []) if r.is_f3_trajectory]))
-        if any(r.is_f3_trajectory for r in by_class.get(c, [])) else 0.0
+        c: (float(np.median([r.late_drop for r in by_class.get(c, [])
+                             if r.is_f3_trajectory]))
+            if any(r.is_f3_trajectory for r in by_class.get(c, [])) else 0.0)
         for c in classes
     }
-    # Alignment is reported among trajectory-bearing instances per class.
-    align_HT = {
-        c: (_alignment_rate(
-            [r.mid_peak_layer_new for r in by_class.get(c, []) if r.is_f3_trajectory],
-            ell_HT, k_align,
-        ) if ell_HT is not None and any(r.is_f3_trajectory for r in by_class.get(c, []))
-            else None)
-        for c in classes
-    }
-    align_R = {
-        c: (_alignment_rate(
-            [r.mid_peak_layer_new for r in by_class.get(c, []) if r.is_f3_trajectory],
-            ell_R, k_align,
-        ) if ell_R is not None and any(r.is_f3_trajectory for r in by_class.get(c, []))
-            else None)
+    suppression_mean = {
+        c: (float(np.mean([r.suppression_drop for r in by_class.get(c, [])]))
+            if by_class.get(c) else 0.0)
         for c in classes
     }
 
-    # Cramér's V on (B1-success vs B1-failure, trajectory yes/no).  Methodology
-    # line 410: use the failure / success populations restricted to PARAM_OLD
-    # ∪ PARAM_OTHER (the temporal-conflict populations).
-    fail_yes = sum(
-        1 for r in results
-        if r.is_f3_trajectory and r.b1_success is False
-        and r.param_class in ("PARAM_OLD", "PARAM_OTHER")
-    )
-    fail_no = sum(
-        1 for r in results
-        if not r.is_f3_trajectory and r.b1_success is False
-        and r.param_class in ("PARAM_OLD", "PARAM_OTHER")
-    )
-    succ_yes = sum(
-        1 for r in results
-        if r.is_f3_trajectory and r.b1_success is True
-        and r.param_class in ("PARAM_OLD", "PARAM_OTHER")
-    )
-    succ_no = sum(
-        1 for r in results
-        if not r.is_f3_trajectory and r.b1_success is True
-        and r.param_class in ("PARAM_OLD", "PARAM_OTHER")
-    )
-    cramer_v = _cramer_v_2x2(np.array([[fail_yes, fail_no], [succ_yes, succ_no]]))
+    lens_decodable_fraction = float(np.mean([int(_is_lens_decodable(r)) for r in results]))
 
-    gap_pp = traj_rate["PARAM_OLD"] - traj_rate["PARAM_OTHER"]
-
-    # Positive-control gates (methodology lines 405–411 + asymmetric reading L412+).
-    pc = {
-        "PARAM_OLD_traj_rate_ge_0.40":
-            traj_rate["PARAM_OLD"] >= F3A_PARAM_OLD_TRAJ_RATE,
-        "PARAM_NEW_traj_rate_le_0.20":
-            traj_rate["PARAM_NEW"] <= F3A_PARAM_NEW_TRAJ_RATE_MAX,
-        "PARAM_OLD_align_ge_0.60_any":
-            ((align_HT["PARAM_OLD"] or 0) >= F3A_ALIGN_RATE_THR
-             or (align_R["PARAM_OLD"] or 0) >= F3A_ALIGN_RATE_THR),
-        "median_late_drop_PARAM_OLD_ge_0.15":
-            median_drop["PARAM_OLD"] >= F3A_MEDIAN_LATE_DROP_PARAM_OLD,
-        "median_late_drop_PARAM_NEW_le_0.05":
-            median_drop["PARAM_NEW"] <= F3A_MEDIAN_LATE_DROP_CONTROL_MAX,
-        "cramer_v_ge_0.30": cramer_v >= F3A_CRAMER_V_THR,
-        "PARAM_OLD_over_OTHER_pp_ge_0.10":
-            gap_pp >= F3A_PARAM_OLD_OVER_OTHER_PP,
-    }
-
-    # Asymmetric reading (methodology lines 412–416).
-    if (not pc["PARAM_OLD_traj_rate_ge_0.40"]
-            and traj_rate["PARAM_OTHER"] >= F3A_PARAM_OLD_TRAJ_RATE):
-        reading = ("PARAM_OLD_premise_undermined_PARAM_OTHER_present — "
-                   "continue only as broader A1-parametric override analysis")
-    elif (traj_rate["PARAM_OTHER"] >= traj_rate["PARAM_OLD"]
-          and traj_rate["PARAM_OTHER"] >= F3A_PARAM_OLD_TRAJ_RATE):
-        reading = ("temporal_specificity_falsified — PARAM_OTHER matches "
-                   "PARAM_OLD thresholds; F3 reframed as general A1-parametric override")
-    elif pc["PARAM_OLD_over_OTHER_pp_ge_0.10"] and pc["PARAM_OLD_traj_rate_ge_0.40"]:
-        reading = "F3_stale_temporal_value_supported"
-    else:
-        reading = "F3_partial — see positive_control gates"
+    # Confirmed-stale LOWER BOUND over the clean (rank-guarded) F3 cohort.
+    clean_f3 = [r for r in results if classify_failure_mode(r, rank_thr=rank_thr) == "F3"]
+    confirmed_stale_fraction = (
+        float(np.mean([int(r.param_class == "TEMPORAL_STALE_CONFIRMED")
+                       for r in clean_f3]))
+        if clean_f3 else 0.0
+    )
 
     sweep = {}
     for t in F3A_TAU_SWEEP:
         key = f"tau_{t:.2f}"
         sweep[key] = {
-            c: (float(np.mean([int(r.is_f3_trajectory_sweep[key]) for r in by_class.get(c, [])]))
+            c: (float(np.mean([int(r.is_f3_trajectory_sweep[key])
+                               for r in by_class.get(c, [])]))
                 if by_class.get(c) else 0.0)
             for c in classes
         }
@@ -1119,12 +1422,10 @@ def summarize_f3a_population(
         counts_by_class=counts,
         f3_traj_rate=traj_rate,
         median_late_drop=median_drop,
-        align_HT_rate=align_HT,
-        align_R_rate=align_R,
-        cramer_v_fail_vs_success=cramer_v,
-        param_old_over_param_other_pp=gap_pp,
-        positive_control=pc,
-        reading=reading,
+        suppression_mean_by_class=suppression_mean,
+        lens_decodable_fraction=lens_decodable_fraction,
+        confirmed_stale_fraction=confirmed_stale_fraction,
+        n_clean_f3=len(clean_f3),
         sweep_traj_rate=sweep,
     )
 
@@ -2900,7 +3201,7 @@ def partition_b1_success_pool(
     rng = _random.Random(seed)
     pool = [
         i for i in instances
-        if i.param_class in ("PARAM_OLD", "PARAM_OTHER", "PARAM_NEW")
+        if i.param_class in PARAM_CLASSES
         and i.b1_success is True
     ]
     if not pool:
@@ -2946,13 +3247,22 @@ def partition_b1_success_pool(
 
 @dataclass
 class F3Verdict:
-    routed: str
-    overridden: str
-    chain: str
-    content: str
-    panel_asymmetry: dict[str, Any]
-    rho_HT: Optional[float]
-    title: str            # one of the 4 resolutions
+    """Spine F3 verdict (Change 5 / Finding 12.2).
+
+    Three states only — ``F3_supported`` / ``F3_not_supported`` /
+    ``F3_underpowered`` — carried by the head-ablation Δ vs the B1-success
+    population null.  The conjunctive routed/overridden/chain/content lattice
+    is retired from the spine (``--hardening`` only).
+    """
+    verdict: str                       # F3_supported / F3_not_supported / F3_underpowered
+    title: str                         # human-facing display title
+    delta: Optional[float]
+    delta_CI: Optional[tuple[float, float]]
+    n_clean_f3: int
+    lens_na: bool
+    lens_decodable_fraction: float
+    confirmed_stale_lower_bound: float
+    top_k_heads: list[tuple[int, int]]
     notes: list[str]
 
 
@@ -3022,93 +3332,72 @@ def _panel_asymmetry_test(
 
 def assign_f3_verdict(
     f3a_summary: F3aSummary,
-    f3_half: Optional[F3HalfResult],
-    f3b: Optional[F3bResult],
-    f3c_by_arm_panel: dict[tuple[str, str], F3cResult],          # (sigma, panel)
-    f3c_content_by_arm_panel: dict[tuple[str, str], F3cContentResult],
+    head_ablation: Optional[F3HeadAblationResult],
+    *,
+    n_clean_f3: Optional[int] = None,
 ) -> F3Verdict:
-    """Combine F3-a/b/c outcomes into the title-resolved F3 verdict.
+    """Spine F3 verdict: head-ablation Δ vs the B1-success population null.
 
-    Implements the policy at methodology lines 367–376.
+    Three states (Finding 12.2):
+
+    * ``F3_underpowered`` — clean F3 cohort ``< F3_CLEAN_F3_MIN`` (power floor on
+      the OVERRIDE claim, Finding 9.3) or no head-ablation result.
+    * ``F3_supported`` — Δ CI excludes 0 on the positive side ⇒ ablating the
+      override heads reduced the parametric advantage.  Display title
+      "Parametric Override Confirmed".
+    * ``F3_not_supported`` — a true falsification (Δ CI includes 0 or is negative).
+
+    ``lens_na`` (``lens_decodable_fraction < F3_LENS_NA_FRACTION``) only
+    suppresses the lens-trajectory metrics + appendix span-knockout; it never
+    decides the causal verdict.  ``confirmed_stale_fraction`` rides along as a
+    one-directional LOWER-BOUND annotation, never a gate.
     """
     notes: list[str] = []
-    rho_HT = f3b.rho_HT if f3b is not None else None
-
-    routed = f3b.routed_verdict if f3b is not None else "not_run"
-
-    # Override / Chain / Content read from the primary substrate arm (ATTN
-    # under the line-583 prior; MLP if (Content) on ATTN is null and MLP is
-    # confirmed).  For simplicity we pool panels: a verdict-mapped string
-    # per arm.
-    def _arm_verdicts(arm: str) -> tuple[str, str, str]:
-        old = f3c_by_arm_panel.get((arm, "PARAM_OLD"))
-        other = f3c_by_arm_panel.get((arm, "PARAM_OTHER"))
-        cold = f3c_content_by_arm_panel.get((arm, "PARAM_OLD"))
-        cother = f3c_content_by_arm_panel.get((arm, "PARAM_OTHER"))
-        if not (old or other):
-            return "not_run", "not_run", "not_run"
-        verdict_o = (old.verdict_override if old else None) or (
-            other.verdict_override if other else "not_run")
-        verdict_c = (old.verdict_chain if old else None) or (
-            other.verdict_chain if other else "not_run")
-        verdict_content = (cold.verdict if cold else None) or (
-            cother.verdict if cother else "not_run")
-        return verdict_o, verdict_c, verdict_content
-
-    o_a, c_a, content_a = _arm_verdicts("attn")
-    o_m, c_m, content_m = _arm_verdicts("mlp")
-
-    # Primary substrate = ATTN (methodology line 583).  Fall back to MLP only
-    # if ATTN is null and MLP is positive.
-    if "Overridden_confirmed" in o_a:
-        overridden, chain, content = o_a, c_a, content_a
-        substrate_used = "attn"
-    elif "Overridden_confirmed" in o_m:
-        overridden, chain, content = o_m, c_m, content_m
-        substrate_used = "mlp"
-    else:
-        overridden, chain, content = o_a, c_a, content_a
-        substrate_used = "attn"
-    notes.append(f"substrate_used={substrate_used}")
-
-    # Panel asymmetry (methodology lines 716–721).
-    pa = {}
-    for arm in ("attn", "mlp"):
-        by_panel = {p: r for (a, p), r in f3c_by_arm_panel.items() if a == arm}
-        by_panel_content = {p: r for (a, p), r in f3c_content_by_arm_panel.items() if a == arm}
-        pa[arm] = _panel_asymmetry_test(by_panel, by_panel_content)
-
-    panel_old_gg_other = (
-        "PARAM_OLD_strictly_greater" in pa.get(substrate_used, {}).get("verdict", "")
+    lens_dec = f3a_summary.lens_decodable_fraction
+    lens_na = lens_dec < F3_LENS_NA_FRACTION
+    if lens_na:
+        notes.append(
+            f"lens_na: lens_decodable_fraction={lens_dec:.3f} < {F3_LENS_NA_FRACTION} "
+            "— trajectory metrics + appendix span-knockout suppressed; causal spine still runs"
+        )
+    n = n_clean_f3 if n_clean_f3 is not None else f3a_summary.n_clean_f3
+    confirmed_stale = f3a_summary.confirmed_stale_fraction
+    notes.append(
+        f"confirmed_stale_lower_bound={confirmed_stale:.3f} "
+        "(one-directional; not a verdict gate)"
     )
-    rho_HT_high = (rho_HT is not None and rho_HT >= F3B_RHO_HIGH)
 
-    # Title resolution (methodology lines 367–376).
-    routed_confirmed = "Routed_confirmed" in routed
-    overridden_confirmed = "Overridden_confirmed" in overridden
-    chain_confirmed = "Chain_confirmed" in chain
-    content_confirmed = "Content_confirmed" in content
+    delta = head_ablation.delta if head_ablation else None
+    delta_CI = head_ablation.delta_CI if head_ablation else None
+    top_k_heads = head_ablation.top_k_heads if head_ablation else []
+    if head_ablation is not None:
+        notes.extend(head_ablation.notes)
 
-    if (routed_confirmed and overridden_confirmed
-            and chain_confirmed and content_confirmed
-            and (panel_old_gg_other or rho_HT_high)):
-        title = "Time Routed but Overridden"
-    elif routed_confirmed and overridden_confirmed:
-        if (not panel_old_gg_other
-                and (rho_HT is not None and rho_HT < F3B_RHO_LOW)):
-            title = "Parametric Default Overrides Routed Context"
-        else:
-            title = "Time Routed but Overridden (partial)"
-    elif overridden_confirmed and not routed_confirmed:
-        title = "Late Parametric Suppression"
-    elif not overridden_confirmed:
-        title = "F3_not_supported"
+    if n < F3_CLEAN_F3_MIN or head_ablation is None:
+        verdict = "F3_underpowered"
+        title = "F3 Underpowered"
+        notes.append(
+            f"underpowered: n_clean_f3={n} < {F3_CLEAN_F3_MIN} (power floor on override cohort)"
+            if head_ablation is not None else "underpowered: no head-ablation result"
+        )
+    elif delta_CI is not None and delta_CI[0] > 0:
+        verdict = "F3_supported"
+        title = "Parametric Override Confirmed"
     else:
-        title = "F3_indeterminate"
+        verdict = "F3_not_supported"
+        title = "F3 Not Supported (falsified)"
 
     return F3Verdict(
-        routed=routed, overridden=overridden, chain=chain, content=content,
-        panel_asymmetry=pa, rho_HT=rho_HT, title=title, notes=notes,
+        verdict=verdict,
+        title=title,
+        delta=delta,
+        delta_CI=delta_CI,
+        n_clean_f3=n,
+        lens_na=lens_na,
+        lens_decodable_fraction=lens_dec,
+        confirmed_stale_lower_bound=confirmed_stale,
+        top_k_heads=top_k_heads,
+        notes=notes,
     )
 
 
@@ -3148,15 +3437,18 @@ __all__ = [
     "F3cContentInstance", "F3cContentResult", "F3Verdict",
     "SublayerProbs",
     "FailureModeSummary", "F3InterventionResult", "F3InterventionSummary",
+    "F3HeadAblationResult",
     # Helpers
     "mid_window", "late_window", "alignment_k",
     "peak_over_all_layers", "suppression_drop", "first_rank_competitive_layer",
     "classify_failure_mode", "summarize_failure_modes",
     "compute_sublayer_probs",
     # IO
-    "load_layer3_by_key", "prepare_f3_instances", "build_f3_pair_prompts",
+    "load_layer3_by_key", "load_timelines", "prepare_f3_instances",
+    "build_f3_pair_prompts",
     # Phase entries
     "run_f3a_trajectory", "summarize_f3a_population",
+    "run_f3_head_ablation",
     "run_f3_late_window_intervention",
     "run_f3_half_bridge",
     "run_f3b_ablation",

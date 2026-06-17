@@ -65,11 +65,14 @@ from tatm.f3_diagnosis import (  # noqa: E402
     F3PreparedInstance,
     assign_f3_verdict,
     build_f3_pair_prompts,
+    classify_failure_mode,
     load_layer3_by_key,
+    load_timelines,
     partition_b1_success_pool,
     prepare_f3_instances,
     run_f3a_trajectory,
     run_f3_half_bridge,
+    run_f3_head_ablation,
     run_f3_late_window_intervention,
     run_f3b_ablation,
     run_f3c_step1_l_star,
@@ -334,10 +337,10 @@ def _write_json(path: Path, payload: Any) -> None:
 def _stratify_failure_traj(
     instances: list[F3PreparedInstance],
 ) -> tuple[list[F3PreparedInstance], list[F3PreparedInstance]]:
-    """Return (PARAM_OLD failure F3-trajectory, PARAM_OTHER failure F3-trajectory)."""
-    old = [i for i in instances if i.param_class == "PARAM_OLD"
+    """Return (confirmed-stale failure F3-traj, ambiguous failure F3-traj)."""
+    old = [i for i in instances if i.param_class == "TEMPORAL_STALE_CONFIRMED"
            and i.b1_success is False and i.is_f3_trajectory]
-    other = [i for i in instances if i.param_class == "PARAM_OTHER"
+    other = [i for i in instances if i.param_class == "PARAM_AMBIGUOUS"
              and i.b1_success is False and i.is_f3_trajectory]
     return old, other
 
@@ -366,11 +369,11 @@ def _select_f3_failure_cohort(
 
     relaxed_old = [
         i for i in instances
-        if i.param_class == "PARAM_OLD" and i.b1_success is False
+        if i.param_class == "TEMPORAL_STALE_CONFIRMED" and i.b1_success is False
     ]
     relaxed_other = [
         i for i in instances
-        if i.param_class == "PARAM_OTHER" and i.b1_success is False
+        if i.param_class == "PARAM_AMBIGUOUS" and i.b1_success is False
     ]
     return relaxed_old, relaxed_other, "relaxed_no_trajectory_prefilter"
 
@@ -399,6 +402,11 @@ def main() -> None:
     parser.add_argument("--data", required=True, help="Layer-2 JSONL with B1 instances")
     parser.add_argument("--layer3", required=True, help="Layer-3 JSONL with A1 parametric answers")
     parser.add_argument("--layer4", help="Layer-4 JSONL with cached B1 behavior labels")
+    parser.add_argument("--timeline-jsonl",
+                        default="data/processed/wikidata_layer1_1000.jsonl",
+                        help="Layer-1 FactTimeline JSONL for the one-directional "
+                             "TEMPORAL_STALE_CONFIRMED lower bound (Change 0). "
+                             "Absent ⇒ confirmation falls back to single answer_old.")
     parser.add_argument("--model", default="microsoft/phi-3-mini-4k-instruct")
     parser.add_argument("--template", default="phi3",
                         choices=["plain", "llama2", "llama3", "phi3", "qwen"])
@@ -420,10 +428,17 @@ def main() -> None:
     parser.add_argument("--skip", nargs="*", default=[],
                         choices=["f3a", "f3interv", "f3half", "f3b", "f3c"],
                         help="Skip F3 sub-experiments")
-    parser.add_argument("--lens-kind", default="tuned", choices=["raw", "tuned"],
-                        help="Lens for F3-a / F3-b / F3-c residual measurements "
-                             "(methodology line 376; tuned falls back to raw "
-                             "with a warning until per-layer probes are trained).")
+    parser.add_argument("--lens-kind", default="raw", choices=["raw", "tuned"],
+                        help="Lens for F3-a trajectory (descriptive, decodability-gated). "
+                             "Default raw: the Tuned Lens mandate is dropped (Finding 6; "
+                             "~0.2pp on high-crystallization models).")
+    parser.add_argument("--hardening", action="store_true",
+                        help="Run the appendix lattice (span intervention, F3-0.5/F3-b/F3-c). "
+                             "Off by default: the spine verdict is the DLA-head-ablation "
+                             "causal test (Findings 3/7/10). Span-knockout is auto-skipped "
+                             "when lens_na (Finding 12.4).")
+    parser.add_argument("--head-topk", type=int, default=4,
+                        help="Cohort-level top-k DLA heads ablated on the spine (Change 3).")
 
     # Cross-experiment inputs.
     parser.add_argument("--temporal-heads", default=None,
@@ -501,7 +516,16 @@ def main() -> None:
     print(f"  device={model_device}  {model.cfg.n_layers} layers x {model.cfg.n_heads} heads")
 
     layer3_by_id, layer3_by_key = load_layer3_by_key(args.layer3)
-    prepared = prepare_f3_instances(model, b1_rows, layer3_by_id, layer3_by_key)
+    timelines = None
+    if args.timeline_jsonl and Path(args.timeline_jsonl).exists():
+        timelines = load_timelines(args.timeline_jsonl)
+        print(f"Loaded {len(timelines)} FactTimelines from {args.timeline_jsonl}")
+    else:
+        print(f"[WARN] timeline JSONL not found ({args.timeline_jsonl}); "
+              "confirmed-stale falls back to single answer_old.")
+    prepared = prepare_f3_instances(
+        model, b1_rows, layer3_by_id, layer3_by_key, timelines=timelines,
+    )
     if not prepared:
         raise SystemExit("[ERROR] No F3-ready instances after Layer3 join.")
 
@@ -534,22 +558,24 @@ def main() -> None:
         "seed": args.sample_seed, "skip": args.skip,
         "partition_A_size": args.partition_A_size,
         "f3c_arms": args.f3c_arms, "f3c_late_protocol": args.f3c_late_protocol,
+        # Spine knobs (Changes 0/3/5).
+        "spine": "dla_head_ablation",
+        "timeline_jsonl": args.timeline_jsonl if timelines is not None else None,
+        "n_timelines": len(timelines) if timelines is not None else 0,
+        "head_topk": args.head_topk,
+        "hardening": bool(args.hardening),
     }
     _write_json(out_dir / "f3_manifest.json", manifest)
 
-    # ── F3-a ─────────────────────────────────────────────────────────
+    # ── F3-a (descriptive trajectory + behavioral classifier) ─────────
     f3a_results = []
     f3a_summary = None
-    ell_R: int | None = None
     if "f3a" not in args.skip:
         f3a_results = run_f3a_trajectory(
             model, prepared, template=args.template,
             lens_kind=args.lens_kind, tau=args.tau,
         )
-        # F3-0.5 might pivot ell_R; if absent (F3-0.5 skipped) we summarise with None.
-        f3a_summary = summarize_f3a_population(
-            f3a_results, ell_HT=ell_HT, ell_R=None, tau=args.tau,
-        )
+        f3a_summary = summarize_f3a_population(f3a_results, tau=args.tau)
         _write_json(out_dir / "f3a_trajectory.json", {
             "tau": args.tau,
             "ell_HT": ell_HT,
@@ -557,34 +583,28 @@ def main() -> None:
             "summary": f3a_summary,
             "per_instance": f3a_results,
         })
-        print("\n[F3-a] Summary:")
-        print(f"  reading: {f3a_summary.reading}")
-        print(f"  traj rates: {f3a_summary.f3_traj_rate}")
-        print(f"  align HT: {f3a_summary.align_HT_rate}")
+        lens_na = f3a_summary.lens_decodable_fraction < 0.10
+        print("\n[F3-a] Summary (descriptive):")
+        print(f"  lens_decodable_fraction={f3a_summary.lens_decodable_fraction:.3f}"
+              f"  (lens_na={lens_na})")
+        print(f"  confirmed_stale_fraction (LOWER BOUND over clean F3)="
+              f"{f3a_summary.confirmed_stale_fraction:.3f}")
+        print(f"  n_clean_f3={f3a_summary.n_clean_f3}")
+        print(f"  traj rates (descriptive): {f3a_summary.f3_traj_rate}")
 
-        # ── Spine: behavioral F1/F2/F3/Mixed distribution (measurable redesign) ──
+        # Behavioral F1/F2/F3/MIXED distribution (rank-guarded classifier).
         mode_summary = summarize_failure_modes(f3a_results)
         _write_json(out_dir / "f3a_failure_modes.json", mode_summary)
         print("\n[F3-a] Failure-mode distribution (behavioral anchor):")
-        print(f"  counts: {mode_summary.counts}")
-        print(f"  F3 cohort n={mode_summary.f3_cohort_n}  "
-              f"mechanism hit-rate={mode_summary.f3_mechanism_hit_rate}")
+        print(f"  counts (clean): {mode_summary.counts}")
+        print(f"  behavioral_f3_rate raw={mode_summary.behavioral_f3_rate:.3f} "
+              f"(n={mode_summary.counts_f3_raw}) "
+              f"clean={mode_summary.behavioral_f3_rate_clean:.3f} "
+              f"(n={mode_summary.f3_cohort_n})")
+        print(f"  b1_scoring_suspect (rank0 but scored failure)="
+              f"{mode_summary.n_b1_scoring_suspect}")
 
-    # ── Spine: F3 causal main line — late-window span intervention ─────
-    if "f3interv" not in args.skip:
-        interv_results, interv_summary = run_f3_late_window_intervention(
-            model, prepared, template=args.template, seed=args.sample_seed,
-        )
-        _write_json(out_dir / "f3_intervention.json", {
-            "summary": interv_summary,
-            "per_instance": interv_results,
-        })
-        print("\n[F3 intervention] Recovery vs random-layer baseline:")
-        for s in interv_summary:
-            print(f"  {s.variant}: recovery={s.recovery_rate:.3f}  "
-                  f"random={s.random_recovery_rate:.3f}  delta={s.delta:+.3f}  (n={s.n})")
-
-    # Partitions on B1-success.
+    # ── Partitions on B1-success (null population for the spine) ───────
     partitions = partition_b1_success_pool(
         prepared, n_partition_A=args.partition_A_size, seed=args.sample_seed,
     )
@@ -598,137 +618,127 @@ def main() -> None:
     print(f"\nPartitions: A={len(partitions['A'])}  B={len(partitions['B'])}  "
           f"C={len(partitions['C'])}")
 
-    # ── F3-0.5 ───────────────────────────────────────────────────────
-    f3_half = None
-    R_pooled: list[tuple[int, int]] = []
-    R_param_old: list[tuple[int, int]] = []
-    R_param_other: list[tuple[int, int]] = []
-    f3_failure_old: list[F3PreparedInstance] = []
-    f3_failure_other: list[F3PreparedInstance] = []
-    f3_failure_cohort_mode = "strict"
-    if "f3half" not in args.skip:
-        strict_old, strict_other = _stratify_failure_traj(prepared)
-        f3_failure_old, f3_failure_other, f3_failure_cohort_mode = (
-            _select_f3_failure_cohort(prepared, policy=args.f3_failure_cohort)
+    # ── SPINE: DLA-head-ablation causal verdict (Changes 2/3/5) ────────
+    head_ablation = None
+    if f3a_summary is not None and "f3interv" not in args.skip:
+        res_by_id = {r.instance_id: r for r in f3a_results}
+        clean_f3 = [
+            i for i in prepared
+            if res_by_id.get(i.instance_id) is not None
+            and classify_failure_mode(res_by_id[i.instance_id]) == "F3"
+        ]
+        # B1-success population control (Finding 2/10): Partition C primary,
+        # fall back to the whole B1-success population if C is empty.
+        success_null = partitions["C"] or [i for i in prepared if i.b1_success is True]
+        print(f"\n[F3 spine] clean_f3={len(clean_f3)}  "
+              f"B1-success-null={len(success_null)}")
+        head_ablation = run_f3_head_ablation(
+            model, clean_f3, success_null,
+            template=args.template, top_k=args.head_topk, seed=args.sample_seed,
         )
-        f3_failure_pool = f3_failure_old + f3_failure_other
-        b1_failures = [i for i in prepared if i.b1_success is False]
-        failure_traj = [i for i in b1_failures if i.is_f3_trajectory]
-        failure_by_class = {
-            cls: sum(1 for i in b1_failures if i.param_class == cls)
-            for cls in ("PARAM_OLD", "PARAM_OTHER", "PARAM_NEW")
-        }
-        failure_traj_by_class = {
-            cls: sum(1 for i in failure_traj if i.param_class == cls)
-            for cls in ("PARAM_OLD", "PARAM_OTHER", "PARAM_NEW")
-        }
-        print(
-            "\n[F3 cohort counts] "
-            f"B1-success={sum(i.b1_success is True for i in prepared)}  "
-            f"B1-failure={len(b1_failures)}  "
-            f"failure_by_class={failure_by_class}  "
-            f"failure_F3traj_total={len(failure_traj)}  "
-            f"failure_F3traj_by_class={failure_traj_by_class}  "
-            f"strict_failure_F3traj_PARAM_OLD={len(strict_old)}  "
-            f"strict_failure_F3traj_PARAM_OTHER={len(strict_other)}  "
-            f"selected_failure_cohort={f3_failure_cohort_mode}  "
-            f"selected_PARAM_OLD={len(f3_failure_old)}  "
-            f"selected_PARAM_OTHER={len(f3_failure_other)}"
-        )
-        if f3_failure_cohort_mode != "strict":
-            print(
-                "[F3 cohort warning] Strict F3 failure-trajectory cohort is empty; "
-                "continuing with relaxed exploratory cohort "
-                "B1-failure ∩ {PARAM_OLD, PARAM_OTHER}."
-            )
-        f3_half = run_f3_half_bridge(
-            model, partitions["A"], f3_failure_old, f3_failure_other,
-            template=args.template, lens_kind=args.lens_kind, H_T=H_T,
-        )
-        ell_R = (int(np.median([l for l, _ in f3_half.R_pooled]))
-                 if f3_half.R_pooled else None)
-        # Re-summarise F3-a with ell_R now known.
-        if f3a_results:
-            f3a_summary = summarize_f3a_population(
-                f3a_results, ell_HT=ell_HT, ell_R=ell_R, tau=args.tau,
-            )
-            _write_json(out_dir / "f3a_trajectory.json", {
-                "tau": args.tau,
-                "ell_HT": ell_HT, "ell_R": ell_R,
-                "lens_kind": args.lens_kind,
-                "summary": f3a_summary,
-                "per_instance": f3a_results,
-            })
-        _write_json(out_dir / "f3_half_attribution.json", f3_half)
-        R_pooled = f3_half.R_pooled
-        R_param_old = f3_half.R_param_old
-        R_param_other = f3_half.R_param_other
-        print(f"\n[F3-0.5] rule={f3_half.selection_rule} |R|={len(R_pooled)} "
-              f"panel_asymmetric={f3_half.panel_asymmetric} "
-              f"ω={f3_half.omega_pooled:.2f}")
-        if not f3_failure_pool:
-            raise SystemExit(
-                "[ERROR] F3 cannot continue: no B1-failure instances in "
-                "PARAM_OLD/PARAM_OTHER. This means the dataset does not contain "
-                "stale/other parametric conflict failures for F3; inspect Layer3 "
-                "A1 answers and B1 behavior."
-            )
-        if not R_pooled:
-            raise SystemExit(
-                "[ERROR] F3 cannot continue: F3-0.5 produced an empty routing "
-                "set R. Increase MAX_INSTANCES or inspect f3a_trajectory.json "
-                "and f3_half_attribution.json."
-            )
+        _write_json(out_dir / "f3_head_ablation.json", head_ablation)
+        print(f"  top-k heads={head_ablation.top_k_heads}")
+        print(f"  Δ(logit-diff) failure−success={head_ablation.delta:+.4f}  "
+              f"CI={head_ablation.delta_CI}")
 
-    # ── F3-b ─────────────────────────────────────────────────────────
+        verdict = assign_f3_verdict(
+            f3a_summary, head_ablation, n_clean_f3=len(clean_f3),
+        )
+        _write_json(out_dir / "f3_verdict.json", verdict)
+        print(f"\n[F3 verdict] {verdict.verdict}  —  {verdict.title!r}")
+        print(f"  Δ={verdict.delta}  CI={verdict.delta_CI}  "
+              f"n_clean_f3={verdict.n_clean_f3}  lens_na={verdict.lens_na}")
+        print(f"  confirmed_stale_lower_bound={verdict.confirmed_stale_lower_bound:.3f}")
+        for note in verdict.notes:
+            print(f"    - {note}")
+
+    # ── Appendix lattice (HARDENING only — Findings 3/6/7/12.4) ────────
+    if args.hardening and f3a_summary is not None:
+        lens_na = f3a_summary.lens_decodable_fraction < 0.10
+        _run_hardening(
+            model, prepared, partitions, args, out_dir, ell_HT, H_T, lens_na,
+        )
+
+    print("\nF3 Diagnostic complete. Results saved to:", out_dir)
+
+
+def _run_hardening(
+    model, prepared, partitions, args, out_dir: Path, ell_HT, H_T, lens_na: bool,
+) -> None:
+    """Appendix lattice: span knockout (only when ``not lens_na``) + F3-0.5/b/c.
+
+    None of these feed the spine verdict (Findings 3/7/10); they are retained
+    for low-crystallization robustness and exploratory analysis only.
+    """
+    # Appendix span intervention — only when the lens is decodable (Finding 12.4).
+    if not lens_na and "f3interv" not in args.skip:
+        interv_results, interv_summary = run_f3_late_window_intervention(
+            model, prepared, template=args.template, seed=args.sample_seed,
+        )
+        _write_json(out_dir / "f3_intervention.json", {
+            "summary": interv_summary, "per_instance": interv_results,
+        })
+        print("\n[hardening] span intervention (appendix):")
+        for s in interv_summary:
+            print(f"  {s.variant}: recovery={s.recovery_rate:.3f}  "
+                  f"random={s.random_recovery_rate:.3f}  delta={s.delta:+.3f}  (n={s.n})")
+    elif lens_na:
+        print("\n[hardening] lens_na ⇒ skipping appendix span-knockout (Finding 12.4)")
+
+    # F3-0.5 / F3-b / F3-c lattice (panel keys migrated to the new taxonomy).
+    f3_failure_old, f3_failure_other, mode = _select_f3_failure_cohort(
+        prepared, policy=args.f3_failure_cohort,
+    )
+    f3_failure_pool = f3_failure_old + f3_failure_other
+    if not f3_failure_pool:
+        print("[hardening] no B1-failure conflict instances; skipping F3-0.5/b/c.")
+        return
+    print(f"[hardening] failure cohort mode={mode}  "
+          f"TEMPORAL_STALE_CONFIRMED={len(f3_failure_old)}  "
+          f"PARAM_AMBIGUOUS={len(f3_failure_other)}")
+    f3_half = run_f3_half_bridge(
+        model, partitions["A"], f3_failure_old, f3_failure_other,
+        template=args.template, lens_kind=args.lens_kind, H_T=H_T,
+    )
+    _write_json(out_dir / "f3_half_attribution.json", f3_half)
+    R_pooled = f3_half.R_pooled
+    R_param_old = f3_half.R_param_old
+    R_param_other = f3_half.R_param_other
+    print(f"[hardening] F3-0.5 rule={f3_half.selection_rule} |R|={len(R_pooled)}")
+    if not R_pooled:
+        print("[hardening] empty routing set R; skipping F3-b/F3-c.")
+        return
+
     f3b_res = None
-    if "f3b" not in args.skip and R_pooled:
-        fail_traj_pool = f3_failure_old + f3_failure_other
+    if "f3b" not in args.skip:
         f3b_res = run_f3b_ablation(
-            model, fail_traj_pool, R_pooled,
-            H_T=H_T,
+            model, f3_failure_pool, R_pooled, H_T=H_T,
             partition_B_donors=partitions["B"],
             template=args.template, lens_kind=args.lens_kind,
-            n_random_samples=args.f3b_random_samples,
-            rng_seed=args.sample_seed,
+            n_random_samples=args.f3b_random_samples, rng_seed=args.sample_seed,
         )
         _write_json(out_dir / "f3b_ablation.json", f3b_res)
-        print(f"\n[F3-b] {f3b_res.routed_verdict}; ρ_HT={f3b_res.rho_HT}; "
-              f"primary={f3b_res.primary_protocol}")
+        print(f"[hardening] F3-b {f3b_res.routed_verdict}; ρ_HT={f3b_res.rho_HT}")
 
-    # ── F3-c ─────────────────────────────────────────────────────────
-    f3c_by_arm_panel: dict[tuple[str, str], Any] = {}
-    f3c_content_by_arm_panel: dict[tuple[str, str], Any] = {}
-    if "f3c" not in args.skip and R_pooled:
-        fail_traj_old = f3_failure_old
-        fail_traj_other = f3_failure_other
-
-        S_old, T_old = _split_S_T(fail_traj_old, seed=args.sample_seed)
-        S_other, T_other = _split_S_T(fail_traj_other, seed=args.sample_seed + 1)
+    if "f3c" not in args.skip:
+        S_old, T_old = _split_S_T(f3_failure_old, seed=args.sample_seed)
+        S_other, T_other = _split_S_T(f3_failure_other, seed=args.sample_seed + 1)
         S = S_old + S_other
-        T_pool = {"PARAM_OLD": T_old, "PARAM_OTHER": T_other}
-
-        # Step 1: L^*_σ on S, committal control on Partition C.
+        T_pool = {"TEMPORAL_STALE_CONFIRMED": T_old, "PARAM_AMBIGUOUS": T_other}
         l_star = run_f3c_step1_l_star(
             model, S, partitions["C"],
             template=args.template, lens_kind=args.lens_kind,
         )
         _write_json(out_dir / "f3c_step1_l_star.json", l_star)
-        print(f"\n[F3-c Step 1] L*_attn={l_star['attn'].layers}  "
-              f"L*_mlp={l_star['mlp'].layers}")
-
         R_protocol = f3b_res.primary_protocol if f3b_res else "Z"
         if R_protocol == "disagree":
-            print("  [WARNING] F3-b's (M) and (Z) disagreed directionally; "
-                  "F3-c Chain interaction will be reported as descriptive only.")
-            R_protocol = "Z"  # fall back so the pipeline can still emit metrics
-
+            R_protocol = "Z"
         for sigma in args.f3c_arms:
             ls = l_star[sigma]
             for panel, panel_T in T_pool.items():
                 if not panel_T:
                     continue
-                R_for_panel = (R_param_old if panel == "PARAM_OLD"
+                R_for_panel = (R_param_old if panel == "TEMPORAL_STALE_CONFIRMED"
                                else R_param_other) or R_pooled
                 res = run_f3c_step2_3(
                     model, panel_T, sigma=sigma, L_star=ls.layers,
@@ -737,37 +747,16 @@ def main() -> None:
                     partition_B_donors=partitions["B"],
                     partition_C_success=partitions["C"],
                     template=args.template, lens_kind=args.lens_kind,
-                    rng_seed=args.sample_seed,
-                    population_label=f"{panel} ∩ T",
+                    rng_seed=args.sample_seed, population_label=f"{panel} ∩ T",
                 )
-                f3c_by_arm_panel[(sigma, panel)] = res
                 _write_json(out_dir / f"f3c_step2_3_{sigma}_{panel}.json", res)
-                print(f"  [F3-c 2x2 {sigma}/{panel}] "
-                      f"{res.verdict_override}; {res.verdict_chain}")
-
                 content = run_f3c_step4_content(
                     model, panel_T, sigma=sigma, L_star=ls.layers,
-                    template=args.template,
-                    rng_seed=args.sample_seed,
+                    template=args.template, rng_seed=args.sample_seed,
                 )
-                f3c_content_by_arm_panel[(sigma, panel)] = content
                 _write_json(out_dir / f"f3c_step4_{sigma}_{panel}.json", content)
-                print(f"  [F3-c Step4 {sigma}/{panel}] {content.verdict}")
-
-    # ── Combined verdict ─────────────────────────────────────────────
-    if f3a_summary is not None:
-        verdict = assign_f3_verdict(
-            f3a_summary, f3_half, f3b_res,
-            f3c_by_arm_panel, f3c_content_by_arm_panel,
-        )
-        _write_json(out_dir / "f3_verdict.json", verdict)
-        print(f"\n[F3 verdict] title = {verdict.title!r}")
-        print(f"  routed     = {verdict.routed}")
-        print(f"  overridden = {verdict.overridden}")
-        print(f"  chain      = {verdict.chain}")
-        print(f"  content    = {verdict.content}")
-
-    print("\nF3 Diagnostic complete. Results saved to:", out_dir)
+                print(f"[hardening] F3-c {sigma}/{panel}: "
+                      f"{res.verdict_override}; {content.verdict}")
 
 
 if __name__ == "__main__":

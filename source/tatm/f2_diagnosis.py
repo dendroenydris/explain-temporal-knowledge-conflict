@@ -563,6 +563,26 @@ def compute_temporal_head_dla(
         return {}, 0.0
 
 
+def compute_head_dla(
+    model: HookedTransformer,
+    tokens: torch.Tensor,
+    heads: list[tuple[int, int]],
+    pos_tid: int,
+    neg_tid: int,
+) -> tuple[dict[str, float], float]:
+    """Generalized DLA: project each head onto the ``(pos_tid − neg_tid)`` direction.
+
+    Thin sibling of :func:`compute_temporal_head_dla` for an arbitrary
+    contrast direction over an arbitrary head set.  F3 uses
+    ``(a_param − answer_new)`` over the late-layer head pool to *localize*
+    override heads (head selection only — NOT a verdict; see the
+    direct-effects caveat in :func:`compute_temporal_head_dla`).
+
+    Returns ``(per_head_dla, total)`` with ``"l.h"`` string keys.
+    """
+    return compute_temporal_head_dla(model, tokens, heads, pos_tid, neg_tid)
+
+
 def classify_f2_regime(
     route_score_peak: float,
     p_new_at_final: float,

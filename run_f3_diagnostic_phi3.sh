@@ -57,12 +57,21 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 
 # F3 knobs
 TAU="${TAU:-0.10}"
-LENS_KIND="${LENS_KIND:-tuned}"
+# Default lens = raw (the Tuned Lens mandate was dropped; ~0.2pp on
+# high-crystallization models). The spine verdict never depends on the lens.
+LENS_KIND="${LENS_KIND:-raw}"
+# One-directional timeline-confirmed temporal-stale lower bound (Change 0).
+TIMELINE_JSONL="${TIMELINE_JSONL:-data/processed/wikidata_layer1_1000.jsonl}"
+# Spine = DLA-head-ablation causal verdict (default). HARDENING=1 additionally
+# runs the appendix lattice (span KO when not lens_na, F3-0.5/F3-b/F3-c).
+HARDENING="${HARDENING:-0}"
+HEAD_TOPK="${HEAD_TOPK:-4}"
 PARTITION_A_SIZE="${PARTITION_A_SIZE:-100}"
 F3B_RANDOM_SAMPLES="${F3B_RANDOM_SAMPLES:-20}"
 SAMPLE_SEED="${SAMPLE_SEED:-42}"
 DTYPE="${DTYPE:-float16}"
-RUN_M_PROTOCOL="${RUN_M_PROTOCOL:-1}"
+# M protocol only affects the hardening F3-c late-KO; gate it on HARDENING.
+RUN_M_PROTOCOL="${RUN_M_PROTOCOL:-0}"
 F3_FAILURE_COHORT="${F3_FAILURE_COHORT:-auto}"
 
 # Maximum number of instances to process from the dataset.
@@ -176,6 +185,9 @@ echo " TEMP. HEADS  : ${TEMPORAL_HEADS}"
 echo " OUT_DIR      : ${OUT_DIR}"
 echo " TAU          : ${TAU}"
 echo " LENS         : ${LENS_KIND}"
+echo " TIMELINE     : ${TIMELINE_JSONL}"
+echo " HARDENING    : ${HARDENING}"
+echo " HEAD_TOPK    : ${HEAD_TOPK}"
 echo " DTYPE        : ${DTYPE}"
 echo " RUN_M_PROTOCOL: ${RUN_M_PROTOCOL}"
 echo " F3_FAILURE_COHORT: ${F3_FAILURE_COHORT}"
@@ -195,6 +207,12 @@ if [ -n "${F1B_RESULTS:-}" ] && [ -f "${F1B_RESULTS}" ]; then
 fi
 # Override ell_HT if pre-computed
 if [ -n "${ELL_HT:-}" ]; then ARGS+=(--ell-HT "${ELL_HT}"); fi
+# Timeline for the confirmed-stale lower bound (Change 0).
+if [ -n "${TIMELINE_JSONL}" ]; then ARGS+=(--timeline-jsonl "${TIMELINE_JSONL}"); fi
+# Spine head-ablation top-k.
+ARGS+=(--head-topk "${HEAD_TOPK}")
+# Appendix lattice only when HARDENING=1.
+if [ "${HARDENING}" = "1" ]; then ARGS+=(--hardening); fi
 
 mkdir -p "${OUT_DIR}"
 
@@ -237,7 +255,7 @@ echo "[$(date '+%H:%M:%S')] Phase 1 (Z protocol) complete."
 # ═════════════════════════════════════════════════════════════════════════════
 
 OUT_DIR_M="${OUT_DIR}_M"
-if [ "${RUN_M_PROTOCOL}" = "1" ]; then
+if [ "${HARDENING}" = "1" ] && [ "${RUN_M_PROTOCOL}" = "1" ]; then
 mkdir -p "${OUT_DIR_M}"
 
 # Symlink Phase-1 upstream outputs so Phase-2 can resolve partition/routing data.
@@ -275,7 +293,8 @@ python scripts/run_f3_diagnostic.py \
 echo "[$(date '+%H:%M:%S')] Phase 2 (full M protocol) complete."
 else
 echo ""
-echo "[$(date '+%H:%M:%S')] Skipping Phase 2 (M protocol). Set RUN_M_PROTOCOL=1 to run it."
+echo "[$(date '+%H:%M:%S')] Skipping Phase 2 (M protocol) — spine-only run."
+echo "  (Set HARDENING=1 RUN_M_PROTOCOL=1 to run the appendix F3-c M protocol.)"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -303,17 +322,24 @@ from pathlib import Path
 
 out_z = Path("${OUT_DIR}")
 out_m = Path("${OUT_DIR_M}")
-run_m = "${RUN_M_PROTOCOL}" == "1"
+hardening = "${HARDENING}" == "1"
+run_m = hardening and "${RUN_M_PROTOCOL}" == "1"
 
+# Spine artifacts are always required; the lattice artifacts only under HARDENING.
 required_z = [
     "f3_manifest.json",
     "f3a_trajectory.json",
+    "f3a_failure_modes.json",
     "f3a_partition.json",
-    "f3_half_attribution.json",
-    "f3b_ablation.json",
-    "f3c_step1_l_star.json",
+    "f3_head_ablation.json",
     "f3_verdict.json",
 ]
+if hardening:
+    required_z += [
+        "f3_half_attribution.json",
+        "f3b_ablation.json",
+        "f3c_step1_l_star.json",
+    ]
 required_m = ["f3_verdict.json"] if run_m else []
 
 missing = []
@@ -332,21 +358,24 @@ if missing:
         print(f"  {m}")
     sys.exit(1)
 
-# Print final verdict
+# Print final spine verdict (head-ablation Δ vs B1-success population null).
 verdict_path = out_z / "f3_verdict.json"
 with open(verdict_path) as fh:
     v = json.load(fh)
 print("")
-print("══ F3 Final Verdict (Z protocol) ══════════════════════════")
+print("══ F3 Spine Verdict (DLA-head ablation) ════════════════════")
+print(f"  Verdict    : {v.get('verdict', '?')}")
 print(f"  Title      : {v.get('title', '?')}")
-print(f"  Routed     : {v.get('routed', '?')}")
-print(f"  Overridden : {v.get('overridden', '?')}")
-print(f"  Chain      : {v.get('chain', '?')}")
-print(f"  Content    : {v.get('content', '?')}")
-print(f"  Panel asym : {v.get('panel_asymmetry', '?')}")
+print(f"  Delta      : {v.get('delta', '?')}  CI={v.get('delta_CI', '?')}")
+print(f"  n_clean_f3 : {v.get('n_clean_f3', '?')}")
+print(f"  lens_na    : {v.get('lens_na', '?')}  "
+      f"(decodable={v.get('lens_decodable_fraction', '?')})")
+print(f"  confirmed_stale (lower bound): {v.get('confirmed_stale_lower_bound', '?')}")
+print(f"  top-k heads: {v.get('top_k_heads', '?')}")
 print("════════════════════════════════════════════════════════════")
 print("")
 print("[OK] All required outputs present.")
 print(f"  Z results : {out_z}")
-print(f"  M results : {out_m}")
+if run_m:
+    print(f"  M results : {out_m}")
 PY

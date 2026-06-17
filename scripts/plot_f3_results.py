@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""Research-ready figures for F3 Diagnostic results.
+"""Research-ready figures for F3 Diagnostic results (spine = head-ablation verdict).
 
-Generates a 6-panel figure matching the methodology section *F3 Diagnosis*
-(L364–L728):
+The default figure is the crystallization-robust SPINE (Changes 5/8):
 
-  Panel A  —  F3-a trajectory rates per param_class (PARAM_OLD /
-              PARAM_OTHER / PARAM_NEW), with positive-control gates.
-  Panel B  —  F3-a Logit Lens trajectories ``P^l(answer_new)`` per layer,
-              coloured by trajectory presence; ℓ_HT / ℓ_R marks overlaid.
-  Panel C  —  F3-0.5 routing-set heads (per-head attribution heat-map);
-              top-decile heads highlighted plus ω overlap statistics.
-  Panel D  —  F3-b dual (M)/(Z) specificity ratios with bootstrap CIs.
-  Panel E  —  F3-c Step 2–3 Override (ΔD), Chain (I^σ), and flip-rate
-              bar charts per (σ, panel).
-  Panel F  —  F3-c Step 4 Content containment ``r_conflict /
-              r_closed-book / r_random,late / r_random,mid`` with
-              ``0.8 · r_closed-book`` anchor.
+  Panel A  —  F3-a trajectory rates per param_class
+              (TEMPORAL_STALE_CONFIRMED / PARAM_AMBIGUOUS / PARAM_NEW),
+              annotated with ``lens_decodable`` and ``F3_clean (raw=M)``.
+  Panel B  —  F3-a Logit-Lens trajectories ``P^l(answer_new)`` — drawn ONLY when
+              ``not lens_na`` (Finding 12.4); a placeholder otherwise.
+  Panel C  —  Failure-mode distribution (F1/F2/F3/MIXED), raw vs clean F3.
+  Panel D  —  Combined DLA localization + causal head-ablation Δ:
+              per-head DLA magnitudes (top-k) and the population Δ
+              (failure − B1-success) with CI.
+
+The legacy F3-0.5/b/c lattice figure is rendered separately only when the
+corresponding ``--hardening`` artifacts exist.
 
 Usage
 -----
@@ -47,10 +46,17 @@ C_YELLOW = "#F0E442"
 C_GRAY   = "#999999"
 
 CLASS_COLOR = {
-    "PARAM_OLD":   C_RED,
-    "PARAM_OTHER": C_ORANGE,
-    "PARAM_NEW":   C_BLUE,
+    "TEMPORAL_STALE_CONFIRMED": C_RED,
+    "PARAM_AMBIGUOUS":          C_ORANGE,
+    "PARAM_NEW":                C_BLUE,
 }
+CLASS_SHORT = {
+    "TEMPORAL_STALE_CONFIRMED": "STALE_CONF",
+    "PARAM_AMBIGUOUS":          "AMBIG",
+    "PARAM_NEW":                "NEW",
+}
+PARAM_CLASSES = ["TEMPORAL_STALE_CONFIRMED", "PARAM_AMBIGUOUS", "PARAM_NEW"]
+LENS_NA_THRESHOLD = 0.10
 
 plt.rcParams.update({
     "font.family":       "sans-serif",
@@ -87,13 +93,20 @@ def _panel_label(ax, letter: str, x: float = -0.10, y: float = 1.06) -> None:
             fontsize=14, fontweight="bold", va="top", ha="left")
 
 
+def _lens_na(f3a: dict | None) -> bool:
+    if not f3a:
+        return True
+    frac = (f3a.get("summary", {}) or {}).get("lens_decodable_fraction", 0.0)
+    return float(frac) < LENS_NA_THRESHOLD
+
+
 # ─────────────────────────────────────────────────────────────────────
-# Panel A — F3-a trajectory rates
+# Panel A — F3-a trajectory rates (descriptive) + spine annotations
 # ─────────────────────────────────────────────────────────────────────
 
 
-def panel_a(ax: plt.Axes, f3a: dict | None) -> None:
-    ax.set_title("F3-a Trajectory rates by param_class")
+def panel_a(ax: plt.Axes, f3a: dict | None, modes: dict | None) -> None:
+    ax.set_title("F3-a trajectory rates by param_class")
     if not f3a:
         ax.text(0.5, 0.5, "(F3-a not run)", ha="center", va="center",
                 transform=ax.transAxes, color=C_GRAY)
@@ -101,35 +114,33 @@ def panel_a(ax: plt.Axes, f3a: dict | None) -> None:
         _panel_label(ax, "A")
         return
 
-    summary = f3a.get("summary", {})
-    classes = ["PARAM_OLD", "PARAM_OTHER", "PARAM_NEW"]
-    rates = [summary.get("f3_traj_rate", {}).get(c, 0.0) for c in classes]
-    counts = [summary.get("counts_by_class", {}).get(c, 0) for c in classes]
-    bars = ax.bar(classes, rates,
-                  color=[CLASS_COLOR[c] for c in classes],
+    summary = f3a.get("summary", {}) or {}
+    rates = [summary.get("f3_traj_rate", {}).get(c, 0.0) for c in PARAM_CLASSES]
+    counts = [summary.get("counts_by_class", {}).get(c, 0) for c in PARAM_CLASSES]
+    labels = [CLASS_SHORT[c] for c in PARAM_CLASSES]
+    bars = ax.bar(labels, rates, color=[CLASS_COLOR[c] for c in PARAM_CLASSES],
                   edgecolor="black", linewidth=0.6)
-
-    # Annotate with counts.
     for bar, count in zip(bars, counts):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.02, f"n={count}",
-                ha="center", va="bottom", fontsize=8, color="black")
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+                f"n={count}", ha="center", va="bottom", fontsize=8, color="black")
 
-    # Reference lines from positive-control gates.
-    ax.axhline(0.40, ls="--", color=C_RED, alpha=0.6,
-               label="PARAM_OLD ≥ 0.40 (positive control)")
-    ax.axhline(0.20, ls="--", color=C_BLUE, alpha=0.6,
-               label="PARAM_NEW ≤ 0.20")
     ax.set_ylim(0, 1.0)
-    ax.set_ylabel("F3-trajectory rate")
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=7)
-    reading = summary.get("reading", "")
-    ax.set_xlabel(f"reading: {reading}", fontsize=8)
+    ax.set_ylabel("F3-trajectory rate (descriptive)")
+
+    lens_dec = summary.get("lens_decodable_fraction", 0.0)
+    conf_stale = summary.get("confirmed_stale_fraction", 0.0)
+    n_clean = summary.get("n_clean_f3", 0)
+    raw = (modes or {}).get("counts_f3_raw", 0)
+    note = (f"lens_decodable={lens_dec:.2f}  •  F3_clean={n_clean} (raw={raw})  •  "
+            f"confirmed_stale\u2265{conf_stale:.2f}")
+    if _lens_na(f3a):
+        note += "  •  LENS_NA"
+    ax.set_xlabel(note, fontsize=8)
     _panel_label(ax, "A")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Panel B — F3-a Logit Lens trajectories
+# Panel B — F3-a Logit-Lens trajectories (only when not lens_na)
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -141,225 +152,131 @@ def panel_b(ax: plt.Axes, f3a: dict | None) -> None:
         ax.set_xticks([]); ax.set_yticks([])
         _panel_label(ax, "B")
         return
+    if _lens_na(f3a):
+        frac = (f3a.get("summary", {}) or {}).get("lens_decodable_fraction", 0.0)
+        ax.text(0.5, 0.5,
+                f"lens_na (decodable={frac:.2f} < {LENS_NA_THRESHOLD})\n"
+                "trajectory readout suppressed (Finding 12.4)",
+                ha="center", va="center", transform=ax.transAxes, color=C_GRAY,
+                fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([])
+        _panel_label(ax, "B")
+        return
 
     per = f3a.get("per_instance", [])
     summary = f3a.get("summary", {}) or {}
     n_layers = summary.get("n_layers", 32)
-    ell_HT = f3a.get("ell_HT")
-    ell_R = f3a.get("ell_R")
     mid = summary.get("mid_window", [None, None])
-
-    # Mid-window shaded band.
     if mid[0] is not None and mid[1] is not None:
-        ax.axvspan(mid[0], mid[1], color=C_YELLOW, alpha=0.18, zorder=0,
-                   label=f"mid-window [L/4,2L/3]")
+        ax.axvspan(mid[0], mid[1], color=C_YELLOW, alpha=0.18, zorder=0)
 
-    # Trajectories grouped by class + trajectory-bearing.
-    n_drawn = {"PARAM_OLD": 0, "PARAM_OTHER": 0, "PARAM_NEW": 0}
-    cap = 80   # avoid drawing thousands of lines
+    n_drawn = {c: 0 for c in PARAM_CLASSES}
+    cap = 80
+    median_frc = []
     for row in per:
         cls = row.get("param_class", "?")
         if cls not in CLASS_COLOR:
             continue
+        if row.get("first_rank_competitive_layer", -1) >= 0:
+            median_frc.append(row["first_rank_competitive_layer"])
         if n_drawn.get(cls, cap) >= cap:
             continue
-        n_drawn[cls] = n_drawn.get(cls, 0) + 1
+        n_drawn[cls] += 1
         probs = row.get("p_new", [])
-        color = CLASS_COLOR[cls]
         alpha = 0.7 if row.get("is_f3_trajectory") else 0.18
         lw = 1.0 if row.get("is_f3_trajectory") else 0.5
-        ax.plot(range(len(probs)), probs, color=color, alpha=alpha, lw=lw)
+        ax.plot(range(len(probs)), probs, color=CLASS_COLOR[cls], alpha=alpha, lw=lw)
 
-    if ell_HT is not None:
-        ax.axvline(ell_HT, color=C_GREEN, ls=":", lw=1.5, label=f"ℓ_HT={ell_HT}")
-    if ell_R is not None:
-        ax.axvline(ell_R, color=C_PURPLE, ls=":", lw=1.5, label=f"ℓ_R={ell_R}")
+    if median_frc:
+        med = float(np.median(median_frc))
+        ax.axvline(med, color=C_GREEN, ls=":", lw=1.5,
+                   label=f"median first-rank-competitive={med:.0f}")
+        ax.legend(loc="upper right", framealpha=0.9, fontsize=7)
     ax.set_xlabel("Layer")
     ax.set_ylabel("P^l(answer_new)")
     ax.set_xlim(0, n_layers - 1)
     ax.set_ylim(0, 1.0)
-
-    legend_handles = [
-        mpatches.Patch(color=C_RED,    label="PARAM_OLD"),
-        mpatches.Patch(color=C_ORANGE, label="PARAM_OTHER"),
-        mpatches.Patch(color=C_BLUE,   label="PARAM_NEW"),
-    ]
-    ax.legend(handles=legend_handles, loc="upper right", framealpha=0.9,
-              fontsize=7)
+    legend_handles = [mpatches.Patch(color=CLASS_COLOR[c], label=CLASS_SHORT[c])
+                      for c in PARAM_CLASSES]
+    ax.add_artist(ax.legend(handles=legend_handles, loc="upper left",
+                            framealpha=0.9, fontsize=7))
     _panel_label(ax, "B")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Panel C — F3-0.5 attribution heat-map (Stage 1 minus Stage 2)
+# Panel C — Failure-mode distribution (raw vs clean F3)
 # ─────────────────────────────────────────────────────────────────────
 
 
-def panel_c(ax: plt.Axes, f3half: dict | None) -> None:
-    ax.set_title("F3-0.5 Routing-set attribution (Stage 1 + Stage 2 overlap)")
-    if not f3half:
-        ax.text(0.5, 0.5, "(F3-0.5 not run)", ha="center", va="center",
+def panel_modes(ax: plt.Axes, modes: dict | None) -> None:
+    ax.set_title("Failure-mode distribution (spine classifier)")
+    if not modes or not modes.get("counts"):
+        ax.text(0.5, 0.5, "(no f3a_failure_modes.json)", ha="center", va="center",
                 transform=ax.transAxes, color=C_GRAY)
         ax.set_xticks([]); ax.set_yticks([])
         _panel_label(ax, "C")
         return
-
-    stage1 = np.asarray(f3half["stage1"]["per_head_score"])
-    stage2 = np.asarray(f3half["stage2_pooled"]["per_head_score"])
-    if stage1.size == 0:
-        ax.text(0.5, 0.5, "(empty attribution matrix)", ha="center", va="center",
-                transform=ax.transAxes, color=C_GRAY)
-        ax.set_xticks([]); ax.set_yticks([])
-        _panel_label(ax, "C")
-        return
-
-    diff = stage1 - stage2  # positive ⇒ Stage 1 specific (i.e. R_succ-leaning)
-    vmax = max(abs(diff.min()), abs(diff.max()), 1e-9)
-    im = ax.imshow(diff, aspect="auto", cmap="RdBu_r",
-                   vmin=-vmax, vmax=vmax, origin="lower")
-    plt.colorbar(im, ax=ax, fraction=0.045, pad=0.02)
-    ax.set_xlabel("Head")
-    ax.set_ylabel("Layer")
-
-    # Mark R_pooled.
-    R = f3half.get("R_pooled", [])
-    if R:
-        ys = [int(l) for l, _ in R]
-        xs = [int(h) for _, h in R]
-        ax.scatter(xs, ys, s=22, facecolors="none", edgecolors="black",
-                   linewidths=1.2, label=f"R_pooled (|R|={len(R)})")
-        ax.legend(loc="upper right", framealpha=0.9, fontsize=7)
-
-    note = (
-        f"ω(pooled)={f3half['omega_pooled']:.2f}, "
-        f"ω(OLD)={f3half['omega_param_old']:.2f}, "
-        f"ω(OTHER)={f3half['omega_param_other']:.2f}; rule={f3half['selection_rule']}"
-    )
-    ax.set_title(f"F3-0.5 Routing-set\n{note}", fontsize=9)
+    order = ["F1", "F2", "F3", "MIXED"]
+    counts = modes["counts"]
+    vals = [counts.get(k, 0) for k in order]
+    colors = [C_SKY, C_ORANGE, C_RED, C_GRAY]
+    bars = ax.bar(order, vals, color=colors, edgecolor="black", linewidth=0.6)
+    for bar, v in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width() / 2, v, str(v),
+                ha="center", va="bottom", fontsize=9)
+    raw = modes.get("counts_f3_raw", 0)
+    suspect = modes.get("n_b1_scoring_suspect", 0)
+    ax.set_xlabel(f"F3 clean={counts.get('F3', 0)} (raw={raw})  •  "
+                  f"b1_scoring_suspect={suspect}", fontsize=8)
+    ax.set_ylabel("# B1-failure instances")
     _panel_label(ax, "C")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Panel D — F3-b specificity ratios
+# Panel D — Combined DLA localization + causal head-ablation Δ
 # ─────────────────────────────────────────────────────────────────────
 
 
-def panel_d(ax: plt.Axes, f3b: dict | None) -> None:
-    ax.set_title("F3-b Specificity ratios (95% CI)")
-    if not f3b:
-        ax.text(0.5, 0.5, "(F3-b not run)", ha="center", va="center",
+def panel_dla_delta(ax: plt.Axes, ablation: dict | None) -> None:
+    ax.set_title("DLA-localized heads + causal ablation Δ")
+    if not ablation:
+        ax.text(0.5, 0.5, "(no f3_head_ablation.json)", ha="center", va="center",
                 transform=ax.transAxes, color=C_GRAY)
         ax.set_xticks([]); ax.set_yticks([])
         _panel_label(ax, "D")
         return
 
-    labels = ["δR/δrand-SL", "δR/δrand-DM"]
-    ratios = [f3b["ratio_R_over_rand_same"],
-              f3b["ratio_R_over_rand_depth"]]
-    cis = [f3b["ratio_R_over_rand_same_CI"],
-           f3b["ratio_R_over_rand_depth_CI"]]
+    per_head = ablation.get("per_head_dla", {}) or {}
+    items = sorted(per_head.items(), key=lambda kv: kv[1], reverse=True)
+    labels = [k for k, _ in items]
+    vals = [v for _, v in items]
     xs = np.arange(len(labels))
-    yerr_lo = [r - c[0] for r, c in zip(ratios, cis)]
-    yerr_hi = [c[1] - r for r, c in zip(ratios, cis)]
-    ax.bar(xs, ratios, color=C_BLUE, edgecolor="black", linewidth=0.6,
-           yerr=[yerr_lo, yerr_hi], capsize=4)
-    ax.axhline(1.0, color=C_GRAY, ls="--", lw=1.0, label="ratio = 1")
-    ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=0, fontsize=8)
-    ax.set_ylabel("Ratio")
-    rho = f3b.get("rho_HT")
-    rho_text = f"ρ_HT = {rho:.2f}" if isinstance(rho, (float, int)) else "ρ_HT = n/a"
-    ax.set_xlabel(f"primary={f3b.get('primary_protocol', '?')}  •  {rho_text}\n"
-                  f"{f3b.get('routed_verdict', '')}",
-                  fontsize=8)
+    if labels:
+        ax.bar(xs, vals, color=C_PURPLE, edgecolor="black", linewidth=0.6)
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("cohort-mean DLA  (a_param − answer_new)")
+    ax.axhline(0, color=C_GRAY, lw=0.8)
+
+    delta = ablation.get("delta")
+    ci = ablation.get("delta_CI") or [None, None]
+    eff_f = ablation.get("effect_failure_mean")
+    eff_s = ablation.get("effect_success_mean")
+    n_f = ablation.get("n_clean_f3", 0)
+    n_s = ablation.get("n_success_null", 0)
+    txt = "ablation Δ (failure − B1-success):\n"
+    if delta is not None:
+        txt += f"Δ={delta:+.4f}"
+        if ci[0] is not None:
+            txt += f"  CI=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        txt += "\n"
+    if eff_f is not None and eff_s is not None:
+        txt += f"eff_fail={eff_f:+.3f} (n={n_f})  eff_succ={eff_s:+.3f} (n={n_s})"
+    supported = ci[0] is not None and ci[0] > 0
+    box_color = C_GREEN if supported else C_GRAY
+    ax.text(0.02, 0.97, txt, transform=ax.transAxes, va="top", ha="left",
+            fontsize=8, bbox=dict(boxstyle="round", fc="white", ec=box_color, lw=1.4))
     _panel_label(ax, "D")
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Panel E — F3-c Step 2–3 Override + Chain
-# ─────────────────────────────────────────────────────────────────────
-
-
-def panel_e(ax: plt.Axes, f3c_files: list[tuple[str, str, dict]]) -> None:
-    """``f3c_files`` is a list of ``(sigma, panel, json_dict)``."""
-    ax.set_title("F3-c Step 2–3 Override (ΔD) + Chain (I^σ)")
-    if not f3c_files:
-        ax.text(0.5, 0.5, "(F3-c Step 2-3 not run)", ha="center", va="center",
-                transform=ax.transAxes, color=C_GRAY)
-        ax.set_xticks([]); ax.set_yticks([])
-        _panel_label(ax, "E")
-        return
-
-    labels = [f"{s}/{p}" for s, p, _ in f3c_files]
-    xs = np.arange(len(labels))
-    width = 0.35
-    dD = [d.get("override_dD_mean", 0.0) for _, _, d in f3c_files]
-    dD_CI = [d.get("override_dD_CI", (0.0, 0.0)) for _, _, d in f3c_files]
-    chain = [d.get("chain_I_sigma_mean") or 0.0 for _, _, d in f3c_files]
-    chain_CI = [d.get("chain_I_sigma_CI") or (0.0, 0.0) for _, _, d in f3c_files]
-
-    dD_lo = [v - c[0] for v, c in zip(dD, dD_CI)]
-    dD_hi = [c[1] - v for v, c in zip(dD, dD_CI)]
-    ch_lo = [v - c[0] for v, c in zip(chain, chain_CI)]
-    ch_hi = [c[1] - v for v, c in zip(chain, chain_CI)]
-
-    ax.bar(xs - width / 2, dD, width=width, color=C_PURPLE,
-           label="ΔD = D(3)−D(1)", edgecolor="black", linewidth=0.6,
-           yerr=[dD_lo, dD_hi], capsize=3)
-    ax.bar(xs + width / 2, chain, width=width, color=C_GREEN,
-           label="I^σ (logit space)", edgecolor="black", linewidth=0.6,
-           yerr=[ch_lo, ch_hi], capsize=3)
-    ax.axhline(0, color=C_GRAY, ls="-", lw=0.8)
-    ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
-    ax.set_ylabel("Effect size")
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=7)
-    _panel_label(ax, "E")
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Panel F — F3-c Step 4 Content containment
-# ─────────────────────────────────────────────────────────────────────
-
-
-def panel_f(ax: plt.Axes, content_files: list[tuple[str, str, dict]]) -> None:
-    ax.set_title("F3-c Step 4 Content containment (r)")
-    if not content_files:
-        ax.text(0.5, 0.5, "(F3-c Step 4 not run)", ha="center", va="center",
-                transform=ax.transAxes, color=C_GRAY)
-        ax.set_xticks([]); ax.set_yticks([])
-        _panel_label(ax, "F")
-        return
-
-    labels = [f"{s}/{p}" for s, p, _ in content_files]
-    xs = np.arange(len(labels))
-    width = 0.20
-
-    r_conf  = [d.get("r_conflict", 0.0)     for _, _, d in content_files]
-    r_cb    = [d.get("r_closed_book", 0.0)  for _, _, d in content_files]
-    r_late  = [d.get("r_random_late", 0.0)  for _, _, d in content_files]
-    r_mid   = [d.get("r_random_mid", 0.0)   for _, _, d in content_files]
-
-    ax.bar(xs - 1.5 * width, r_conf, width=width, color=C_PURPLE,
-           label="r_conflict", edgecolor="black", linewidth=0.6)
-    ax.bar(xs - 0.5 * width, r_cb, width=width, color=C_BLUE,
-           label="r_closed_book", edgecolor="black", linewidth=0.6)
-    ax.bar(xs + 0.5 * width, r_late, width=width, color=C_ORANGE,
-           label="r_random_late", edgecolor="black", linewidth=0.6)
-    ax.bar(xs + 1.5 * width, r_mid, width=width, color=C_GRAY,
-           label="r_random_mid", edgecolor="black", linewidth=0.6)
-
-    # 0.8 anchor markers.
-    for i, v in enumerate(r_cb):
-        ax.hlines(0.8 * v, xs[i] - 0.45, xs[i] + 0.45, colors=C_RED,
-                  linewidth=1.2, linestyles="--",
-                  label="0.8 · r_closed_book" if i == 0 else None)
-
-    ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
-    ax.set_ylim(0, 1.0)
-    ax.set_ylabel("Top-k containment fraction")
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=7)
-    _panel_label(ax, "F")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -371,7 +288,55 @@ def title_strip(fig, verdict: dict | None) -> None:
     if verdict is None:
         return
     title = verdict.get("title", "F3")
-    fig.suptitle(f"F3 Diagnosis — {title}", fontsize=14, fontweight="bold")
+    code = verdict.get("verdict", "")
+    fig.suptitle(f"F3 Diagnosis — {title}  [{code}]", fontsize=14, fontweight="bold")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Legacy hardening panels (rendered only when --hardening artifacts exist)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _render_hardening(results: Path, out_dir: Path) -> None:
+    f3half = _load(results / "f3_half_attribution.json")
+    f3b = _load(results / "f3b_ablation.json")
+    interv = _load(results / "f3_intervention.json")
+    if f3half is None and f3b is None and interv is None:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    ax1, ax2 = axes
+    ax1.set_title("F3-0.5 routing set / F3-b (hardening, appendix)")
+    if f3b:
+        labels = ["δR/δrand-SL", "δR/δrand-DM"]
+        ratios = [f3b.get("ratio_R_over_rand_same", 0.0),
+                  f3b.get("ratio_R_over_rand_depth", 0.0)]
+        ax1.bar(labels, ratios, color=C_BLUE, edgecolor="black", linewidth=0.6)
+        ax1.axhline(1.0, color=C_GRAY, ls="--", lw=1.0)
+        ax1.set_ylabel("specificity ratio")
+    else:
+        ax1.text(0.5, 0.5, "(F3-b not run)", ha="center", va="center",
+                 transform=ax1.transAxes, color=C_GRAY)
+    ax2.set_title("Appendix span intervention (not lens_na only)")
+    summ = (interv or {}).get("summary") or []
+    if summ:
+        variants = [s["variant"] for s in summ]
+        rec = [s["recovery_rate"] for s in summ]
+        rnd = [s["random_recovery_rate"] for s in summ]
+        x = np.arange(len(variants))
+        w = 0.38
+        ax2.bar(x - w / 2, rec, w, label="intervention", color=C_GREEN)
+        ax2.bar(x + w / 2, rnd, w, label="random-layer", color=C_GRAY)
+        ax2.set_xticks(x); ax2.set_xticklabels(variants, rotation=15, ha="right")
+        ax2.set_ylabel("answer_new recovery"); ax2.set_ylim(0, 1); ax2.legend()
+    else:
+        ax2.text(0.5, 0.5, "(span KO skipped: lens_na or not run)", ha="center",
+                 va="center", transform=ax2.transAxes, color=C_GRAY)
+    fig.suptitle("F3 hardening (appendix lattice)", fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    for ext in ("pdf", "png"):
+        fig.savefig(out_dir / f"f3_hardening.{ext}")
+    plt.close(fig)
+    print(f"Saved: {out_dir / 'f3_hardening.png'}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -379,117 +344,22 @@ def title_strip(fig, verdict: dict | None) -> None:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def collect_f3c_arm_panel(results_dir: Path, kind: str) -> list[tuple[str, str, dict]]:
-    """``kind`` is ``"step2_3"`` or ``"step4"``.
-
-    Returns a sorted list of ``(sigma, panel, data)`` triples loaded from
-    ``f3c_{step}_{sigma}_{panel}.json`` files.
-    """
-    pattern = "f3c_step2_3_*.json" if kind == "step2_3" else "f3c_step4_*.json"
-    out: list[tuple[str, str, dict]] = []
-    for path in sorted(results_dir.glob(pattern)):
-        parts = path.stem.split("_")
-        if len(parts) < 4:
-            continue
-        sigma = parts[-2]
-        panel = parts[-1]
-        data = _load(path)
-        if data is not None:
-            out.append((sigma, panel, data))
-    return out
-
-
-def panel_failure_modes(ax: plt.Axes, modes: dict | None) -> None:
-    """Spine panel: F1/F2/F3/Mixed distribution (behavioral-anchor classifier)."""
-    ax.set_title("Failure-mode distribution (spine)")
-    if not modes or not modes.get("counts"):
-        ax.text(0.5, 0.5, "no f3a_failure_modes.json", ha="center", va="center",
-                transform=ax.transAxes, color=C_GRAY)
-        ax.set_axis_off()
-        return
-    order = ["F1", "F2", "F3", "MIXED"]
-    counts = modes["counts"]
-    vals = [counts.get(k, 0) for k in order]
-    colors = [C_SKY, C_ORANGE, C_RED, C_GRAY]
-    ax.bar(order, vals, color=colors)
-    for i, v in enumerate(vals):
-        ax.text(i, v, str(v), ha="center", va="bottom", fontsize=9)
-    hit = modes.get("f3_mechanism_hit_rate")
-    n3 = modes.get("f3_cohort_n", 0)
-    sub = f"F3 cohort n={n3}"
-    if hit is not None:
-        sub += f", mechanism hit-rate={hit:.2f}"
-    ax.set_xlabel(sub)
-    ax.set_ylabel("# B1-failure instances")
-
-
-def panel_intervention(ax: plt.Axes, interv: dict | None) -> None:
-    """Spine panel: late-window intervention recovery vs random-layer baseline."""
-    ax.set_title("F3 late-window intervention (spine)")
-    summ = (interv or {}).get("summary") or []
-    if not summ:
-        ax.text(0.5, 0.5, "no f3_intervention.json", ha="center", va="center",
-                transform=ax.transAxes, color=C_GRAY)
-        ax.set_axis_off()
-        return
-    variants = [s["variant"] for s in summ]
-    rec = [s["recovery_rate"] for s in summ]
-    rnd = [s["random_recovery_rate"] for s in summ]
-    x = np.arange(len(variants))
-    w = 0.38
-    ax.bar(x - w / 2, rec, w, label="intervention", color=C_GREEN)
-    ax.bar(x + w / 2, rnd, w, label="random-layer", color=C_GRAY)
-    ax.set_xticks(x)
-    ax.set_xticklabels(variants, rotation=15, ha="right")
-    ax.set_ylabel("answer_new recovery rate")
-    ax.set_ylim(0, 1)
-    ax.legend()
-
-
-def plot_spine(results: Path, out_dir: Path) -> None:
-    """Two-panel spine figure: failure modes + causal recovery (measurable redesign)."""
-    modes  = _load(results / "f3a_failure_modes.json")
-    interv = _load(results / "f3_intervention.json")
-    if modes is None and interv is None:
-        return
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
-    panel_failure_modes(ax1, modes)
-    panel_intervention(ax2, interv)
-    fig.suptitle("F3 measurable-redesign spine", fontsize=13, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    for ext in ("pdf", "png"):
-        fig.savefig(out_dir / f"f3_spine.{ext}")
-    plt.close(fig)
-    print(f"Saved: {out_dir / 'f3_spine.png'}")
-
-
 def render(results: Path, out_dir: Path, figsize: tuple[float, float]) -> None:
-    """Render the 6-panel figure + spine figure for one results directory."""
+    """Render the spine figure (+ hardening figure when artifacts exist)."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    f3a    = _load(results / "f3a_trajectory.json")
-    f3half = _load(results / "f3_half_attribution.json")
-    f3b    = _load(results / "f3b_ablation.json")
+    f3a = _load(results / "f3a_trajectory.json")
+    modes = _load(results / "f3a_failure_modes.json")
+    ablation = _load(results / "f3_head_ablation.json")
     verdict = _load(results / "f3_verdict.json")
-    f3c23  = collect_f3c_arm_panel(results, "step2_3")
-    f3c4   = collect_f3c_arm_panel(results, "step4")
 
     fig = plt.figure(figsize=tuple(figsize), constrained_layout=False)
-    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.55, wspace=0.32,
-                            left=0.07, right=0.97, top=0.93, bottom=0.07)
-    ax_a = fig.add_subplot(gs[0, 0])
-    ax_b = fig.add_subplot(gs[0, 1])
-    ax_c = fig.add_subplot(gs[1, 0])
-    ax_d = fig.add_subplot(gs[1, 1])
-    ax_e = fig.add_subplot(gs[2, 0])
-    ax_f = fig.add_subplot(gs[2, 1])
-
-    panel_a(ax_a, f3a)
-    panel_b(ax_b, f3a)
-    panel_c(ax_c, f3half)
-    panel_d(ax_d, f3b)
-    panel_e(ax_e, f3c23)
-    panel_f(ax_f, f3c4)
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.40, wspace=0.30,
+                           left=0.08, right=0.97, top=0.90, bottom=0.10)
+    panel_a(fig.add_subplot(gs[0, 0]), f3a, modes)
+    panel_b(fig.add_subplot(gs[0, 1]), f3a)
+    panel_modes(fig.add_subplot(gs[1, 0]), modes)
+    panel_dla_delta(fig.add_subplot(gs[1, 1]), ablation)
     title_strip(fig, verdict)
 
     pdf_path = out_dir / "f3_results.pdf"
@@ -500,22 +370,19 @@ def render(results: Path, out_dir: Path, figsize: tuple[float, float]) -> None:
     print(f"Saved: {pdf_path}")
     print(f"Saved: {png_path}")
 
-    # Spine figure (measurable redesign): failure-mode distribution + causal recovery.
-    plot_spine(results, out_dir)
+    _render_hardening(results, out_dir)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Accept both --f3-dir (used by run_f3_diagnostic_phi3.sh) and --results.
     parser.add_argument("--f3-dir", "--results", dest="results", default=None,
-                        help="Directory containing f3*.json outputs (Z protocol)")
+                        help="Directory containing f3*.json outputs")
     parser.add_argument("--f3-dir-m", dest="results_m", default=None,
-                        help="Optional M-protocol results directory; figures go to <out>/M")
+                        help="Optional second results directory; figures go to <out>/M")
     parser.add_argument("--out", default=None,
                         help="Output directory for figures (defaults to <results>/figures)")
-    parser.add_argument("--figsize", nargs=2, type=float, default=[14, 13])
-    # Accepted for shell compatibility; figure titles are taken from f3_verdict.json.
+    parser.add_argument("--figsize", nargs=2, type=float, default=[13, 10])
     parser.add_argument("--model-tag", dest="model_tag", default=None,
                         help="(accepted for compatibility; unused)")
     parser.add_argument("--tau", type=float, default=None,
