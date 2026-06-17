@@ -20,7 +20,7 @@
 #  * Mistral is gated on HF — export HF_TOKEN before submitting (unless cached).
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
-mkdir -p logs results2
+mkdir -p logs results
 
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-knowledge-temporal-kc}"
 MODEL="${MODEL:-mistralai/Mistral-7B-Instruct-v0.1}"
@@ -76,4 +76,4 @@ python scripts/run_eap_circuit.py \
   "${ARGS[@]}" \
   "$@"
 
-echo "[OK] heads -> results2/eap_circuits/${MODEL_NAME}/discovered_temporal_heads.json"
+echo "[OK] heads -> results/eap_circuits/${MODEL_NAME}/discovered_temporal_heads.json"

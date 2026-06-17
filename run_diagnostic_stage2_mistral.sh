@@ -19,8 +19,8 @@ cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 export MODEL="${MODEL:-mistralai/Mistral-7B-Instruct-v0.1}"
 export MODEL_TAG="${MODEL_TAG:-mistral}"
 export TEMPLATE="${TEMPLATE:-mistral}"
-export OUT_DIR="${OUT_DIR:-results2/f2_diagnostic_1000_${MODEL_TAG}}"
-export TEMPORAL_HEADS_FILE="${TEMPORAL_HEADS_FILE:-results2/eap_circuits/Mistral-7B-Instruct-v0.1/discovered_temporal_heads.json}"
+export OUT_DIR="${OUT_DIR:-results/f2_diagnostic_1000_${MODEL_TAG}}"
+export TEMPORAL_HEADS_FILE="${TEMPORAL_HEADS_FILE:-results/eap_circuits/Mistral-7B-Instruct-v0.1/discovered_temporal_heads.json}"
 export F2B_POPULATION="${F2B_POPULATION:-b1_failure}"
 
 if [ -n "${HF_TOKEN:-}" ]; then

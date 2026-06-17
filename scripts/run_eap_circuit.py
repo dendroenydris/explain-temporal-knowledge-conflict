@@ -283,7 +283,7 @@ def main() -> None:
                     help="object first-token index (Phi tokenizers need 1)")
     ap.add_argument("--data-dir", default=str(_ROOT / "data" / "temporal_circuits"),
                     help="dir containing Temporal/ and Invariant/ subdirs")
-    ap.add_argument("--out-root", default=str(_ROOT / "results2" / "eap_circuits"))
+    ap.add_argument("--out-root", default=str(_ROOT / "results" / "eap_circuits"))
     ap.add_argument("--years", nargs="+", default=["1999", "2004", "2009"])
     ap.add_argument("--temporal-categories", nargs="+",
                     default=["time_sports", "time_presidents", "time_ceo",

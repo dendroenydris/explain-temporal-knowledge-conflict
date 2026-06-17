@@ -22,11 +22,11 @@ export MODEL_TAG="${MODEL_TAG:-llama2}"
 export TEMPLATE="${TEMPLATE:-llama2}"
 export LAYER3_JSONL="${LAYER3_JSONL:-data/processed/wikidata_layer3_${MODEL_TAG}_1000.jsonl}"
 export LAYER4_JSONL="${LAYER4_JSONL:-data/processed/wikidata_layer4_${MODEL_TAG}_1000.jsonl}"
-export OUT_DIR="${OUT_DIR:-results2/f3_diagnostic_1000_${MODEL_TAG}}"
+export OUT_DIR="${OUT_DIR:-results/f3_diagnostic_1000_${MODEL_TAG}}"
 export RUN_M_PROTOCOL="${RUN_M_PROTOCOL:-0}"
 
 MODEL_NAME="${MODEL_NAME:-Llama-2-7b-chat-hf}"
-EAP_HEADS_FILE="${EAP_HEADS_FILE:-results2/eap_circuits/${MODEL_NAME}/discovered_temporal_heads.json}"
+EAP_HEADS_FILE="${EAP_HEADS_FILE:-results/eap_circuits/${MODEL_NAME}/discovered_temporal_heads.json}"
 
 if [ -n "${HF_TOKEN:-}" ]; then export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"; fi
 

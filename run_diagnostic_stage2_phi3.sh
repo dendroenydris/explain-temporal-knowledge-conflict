@@ -27,10 +27,10 @@ DTYPE="${DTYPE:-auto}"
 F2B_POPULATION="${F2B_POPULATION:-reverts_old}"
 # F1 cross-reference (optional): if these exist, F2 verdicts are ruled-out
 # against F1-a Step-5 (per instance) and F1-b is recorded as a SOFT annotation
-# (no longer invalidates the verdicts).  Default to the results2/ F1 dir for
+# (no longer invalidates the verdicts).  Default to the results/ F1 dir for
 # this model tag; skipped automatically if the files are absent.
-F1_RESULTS="${F1_RESULTS:-results2/f1_diagnostic_1000_${MODEL_TAG}/f1a_sat_probe.json}"
-F1B_RESULTS="${F1B_RESULTS:-results2/f1_diagnostic_1000_${MODEL_TAG}/f1b_attention_comparison.json}"
+F1_RESULTS="${F1_RESULTS:-results/f1_diagnostic_1000_${MODEL_TAG}/f1a_sat_probe.json}"
+F1B_RESULTS="${F1B_RESULTS:-results/f1_diagnostic_1000_${MODEL_TAG}/f1b_attention_comparison.json}"
 
 command -v conda >/dev/null || {
   echo "[ERROR] conda not found. Run setup-conda3 on the cluster, then create ${CONDA_ENV_NAME} from environment.yml." >&2

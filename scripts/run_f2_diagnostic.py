@@ -864,7 +864,7 @@ def main():
         "--f1-results",
         help=(
             "Optional path to F1-a output JSON (typically "
-            "results2/f1_diagnostic_1000_<tag>/f1a_sat_probe.json).  When provided, "
+            "results/f1_diagnostic_1000_<tag>/f1a_sat_probe.json).  When provided, "
             "every F2 verdict is cross-referenced against F1-a Step 5's "
             "per-instance F1-positive verdict (methodology line 284): "
             "F1-positive ⇒ year not read ⇒ classified F1, not F2."
@@ -881,7 +881,7 @@ def main():
         "--f1b-results",
         help=(
             "Optional path to F1-b output JSON (typically "
-            "results2/f1_diagnostic_1000_<tag>/f1b_attention_comparison.json).  When "
+            "results/f1_diagnostic_1000_<tag>/f1b_attention_comparison.json).  When "
             "provided, the population-level Mann-Whitney p-value is read "
             "and recorded as the boolean ``f1b_nonsignif`` if F1-b fails "
             "to confirm the old population premise. It does not alter the "

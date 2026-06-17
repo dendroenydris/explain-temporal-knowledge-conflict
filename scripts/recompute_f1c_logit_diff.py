@@ -23,8 +23,8 @@ answer_old, i.e. the year *mattered* (the F1-correct direction).
 Usage
 -----
     python scripts/recompute_f1c_logit_diff.py \
-        --f1c results2/f1_diagnostic_1000_phi3/f1c_attention_knockout.json \
-        --out results2/f1_diagnostic_1000_phi3/f1c_logit_diff_recompute.json
+        --f1c results/f1_diagnostic_1000_phi3/f1c_attention_knockout.json \
+        --out results/f1_diagnostic_1000_phi3/f1c_logit_diff_recompute.json
 """
 from __future__ import annotations
 
