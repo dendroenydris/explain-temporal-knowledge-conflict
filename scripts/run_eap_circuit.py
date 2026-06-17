@@ -155,6 +155,8 @@ def run_one_circuit(model, rows: list[dict], tag: str, *, out_dir: Path,
     if len(rows) < 2:
         print(f"  [skip] {tag}: only {len(rows)} pairs")
         return 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     csv_path = tmp_dir / f"{tag}.csv"
     pd.DataFrame(rows).to_csv(csv_path, index=False)
 
@@ -188,9 +190,10 @@ def run_one_circuit(model, rows: list[dict], tag: str, *, out_dir: Path,
             head_scores[name] += abs(float(edge.score))
 
     out_path = out_dir / f"simplified_{tag}.json"
-    json.dump({"nodes": {n: {} for n in sorted(important)},
-               "head_scores": dict(head_scores)},
-              open(out_path, "w"), indent=1)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as fh:
+        json.dump({"nodes": {n: {} for n in sorted(important)},
+                   "head_scores": dict(head_scores)}, fh, indent=1)
     print(f"  [ok] {tag}: {len(rows)} pairs -> {len(important)} nodes, "
           f"{len(head_scores)} scored heads")
     return len(important)
@@ -391,7 +394,9 @@ def main() -> None:
         "models": {args.model_name: {"model": args.model, "top_heads": top_heads}},
     }
     out_json = out_dir / "discovered_temporal_heads.json"
-    json.dump(result, open(out_json, "w"), indent=2)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    with out_json.open("w") as fh:
+        json.dump(result, fh, indent=2)
     print("\n[done] {:.0f}s".format(time.time() - t0))
     print("[heads] top-{} temporal heads:".format(args.top_k))
     for h in ranked:
