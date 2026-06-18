@@ -14,6 +14,8 @@
 # Thin wrapper over the shared build_wikidata_layer3_1000.sh driver.
 # Must be run before run_diagnostic_stage1_llama2.sh (needs A1 for B5 filter)
 # and before build_wikidata_layer4_llama2_1000.sh.
+# Note: build_wikidata_layer3.py now uses zero-shot prompt style by default for
+# llama2 to avoid one-shot demo-answer leakage under truncated generations.
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 

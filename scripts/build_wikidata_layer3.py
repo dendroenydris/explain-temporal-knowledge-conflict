@@ -102,7 +102,7 @@ def build_concise_prompt(
     question: str,
     template: str,
 ) -> str:
-    """Build a one-shot prompt that asks for only the answer string."""
+    """Build a concise prompt that asks for only the answer string."""
     instruction = (
         "Answer each question with only the person's or entity's name. "
         "Do not explain. "
@@ -130,12 +130,13 @@ def build_concise_prompt(
             "<|im_start|>assistant\n"
         )
     if template == "llama2":
+        # Llama-2 frequently echoes the one-shot example and then truncates,
+        # which can leak the demo answer ("Theresa May") into extraction.
+        # Use zero-shot by default for llama2.
         return (
             "[INST] <<SYS>>\n"
             f"{instruction}\n"
             "<</SYS>>\n\n"
-            f"Question: {ONE_SHOT_QUESTION}\n"
-            f"Answer: {ONE_SHOT_ANSWER}\n\n"
             f"{current}\n"
             "Answer: [/INST]"
         )
@@ -444,7 +445,11 @@ def main() -> None:
     print(f"Model         : {args.model}")
     print(f"Template      : {args.template}")
     print(f"Use context   : {args.use_context}")
-    print("Prompt style  : one-shot concise answer")
+    prompt_style = (
+        "zero_shot_concise_answer" if args.template == "llama2"
+        else "one_shot_concise_answer"
+    )
+    print(f"Prompt style  : {prompt_style}")
     print(f"Selected rows : {len(records)}")
 
     print(f"\nLoading model {args.model} ...")
@@ -476,7 +481,7 @@ def main() -> None:
                 "template": args.template,
                 "question": record.get("question", ""),
                 "uses_context": args.use_context,
-                "prompt_style": "one_shot_concise_answer",
+                "prompt_style": prompt_style,
                 "context": prompt_context,
                 "prompt": prompt,
                 "model_output_raw": raw,
