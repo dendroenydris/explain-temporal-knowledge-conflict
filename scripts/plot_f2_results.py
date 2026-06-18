@@ -228,13 +228,13 @@ def panel_c(ax: plt.Axes, data: dict) -> None:
     ax.set_ylabel("# instances")
     ax.set_title(f"F2-a: STR Activation Patching Recovery\n"
                  f"(n={n_valid} valid instances)", pad=8)
-    ax.legend(frameon=False, fontsize=8.5)
+    ax.legend(frameon=False, fontsize=8.5, loc="upper right")
 
-    # Summary stats annotation
+    # Summary stats annotation (upper-left to avoid the legend)
     ax.text(
-        0.97, 0.95,
+        0.03, 0.95,
         f"mean = {recs.mean():+.3f}\nmedian = {np.median(recs):+.3f}",
-        transform=ax.transAxes, ha="right", va="top",
+        transform=ax.transAxes, ha="left", va="top",
         fontsize=8.5, color="#333333",
         bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc", alpha=0.8),
     )
@@ -521,10 +521,10 @@ def panel_dla(ax: plt.Axes, f2b_data: dict) -> None:
     ax.set_ylabel("# instances")
     ax.set_title("DLA readout — authoritative F1/F2 separator\n"
                  f"writes/F2 (>0): {n_f2}   ·   no-write/F1 (≤0): {n_f1}", pad=8)
-    ax.legend(frameon=False, fontsize=8.5)
-    ax.text(0.97, 0.95,
+    ax.legend(frameon=False, fontsize=8.5, loc="upper right")
+    ax.text(0.03, 0.95,
             f"mean = {vals.mean():+.3f}\nmedian = {np.median(vals):+.3f}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.5,
             color="#333333",
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc", alpha=0.8))
     _panel_label(ax, "DLA")

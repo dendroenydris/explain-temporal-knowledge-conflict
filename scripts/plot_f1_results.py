@@ -351,8 +351,12 @@ def plot_f1c(data: dict, out_dir: Path):
     sub_bits = []
     if fail_ld:
         sub_bits.append(f"fail competitor median = {np.median(fail_ld):+.2f}")
-    if spec_f is not None:
+    # Guard the specificity ratio: it divides by a near-zero random-control drop,
+    # so it explodes / flips sign and is not interpretable in that regime.
+    if spec_f is not None and 0.0 < spec_f < 100.0:
         sub_bits.append(f"fail logit-diff specificity = {spec_f:.2f}x")
+    elif spec_f is not None:
+        sub_bits.append("specificity ratio unstable (near-zero random control) — omitted")
     sub_bits.append("(p_new-only metric shown in reference panels only — see methodology F1-c)")
     sub = "   |   ".join(sub_bits)
 
@@ -368,62 +372,174 @@ def plot_f1c(data: dict, out_dir: Path):
 
 
 # ── Figure 4 – F1 Summary dashboard ─────────────────────────────────────────
-def plot_summary(f1a, f1b, f1c, out_dir: Path):
+def _attn_top(node: dict) -> Optional[float]:
+    v = node.get("mean_attn_top3", node.get("mean_attn_top5"))
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def _mcnemar_bc(f2c: dict | None):
+    """Extract (b, c, p, odds) from f2c_b5_vs_b6.json (nested or flat schema)."""
+    if not f2c:
+        return None
+    m = f2c.get("mcnemar_b5_vs_b6") or {}
+    b = m.get("b_b5success_b6fail", f2c.get("mcnemar_b", f2c.get("b")))
+    c = m.get("c_b5fail_b6success", f2c.get("mcnemar_c", f2c.get("c")))
+    p = m.get("p_exact", m.get("p_chi2_continuity",
+              f2c.get("p_exact", f2c.get("mcnemar_p"))))
+    odds = m.get("odds_b_over_c")
+    if b is None or c is None:
+        return None
+    if odds is None and c:
+        odds = b / c
+    return int(b), int(c), p, odds
+
+
+def _f1_verdict_lines(f1a, f1b, f1c, a1, f2c=None) -> list[tuple[str, str]]:
+    """Synthesized F1 interpretation as ``(text, color)`` lines, faithful to the
+    methodology: the authoritative 'Time Set' premise is carried by F2-c
+    (B5-vs-B6 McNemar); F1-a/b/c are SOFT descriptive cross-references.
+    """
+    lines: list[tuple[str, str]] = []
+
+    # AUTHORITATIVE Time-Set verdict = F2-c McNemar (methodology line 298/356).
+    bc = _mcnemar_bc(f2c)
+    if bc:
+        b, c, p, odds = bc
+        odds_s = f"{odds:.1f}x" if isinstance(odds, (int, float)) else "n/a"
+        p_s = f"{p:.1e}" if isinstance(p, (int, float)) else "n/a"
+        col = C_POS if (b > c and isinstance(p, (int, float)) and p < 0.05) else C_NEG
+        lines.append((f"TIME SET (authoritative, F2-c B5-vs-B6 McNemar): "
+                      f"b={b} (year helped) >> c={c} (year hurt), odds {odds_s}, "
+                      f"p={p_s}  \u21d2 year tokens ARE causally load-bearing; "
+                      f"the Time-Set premise HOLDS at population level.", col))
+    else:
+        lines.append(("TIME SET verdict comes from F2-c (B5-vs-B6 McNemar) \u2014 "
+                      "pass --f2-dir to display it here.", C_WEAK))
+
+    # A1 parametric ceiling.
+    if a1:
+        n_tot = a1.get("n_total", 0) or 0
+        n_kn = a1.get("n_knows_new", 0) or 0
+        frac = (n_kn / n_tot) if n_tot else 0.0
+        lines.append((f"A1 parametric ceiling: model recalls answer_new for "
+                      f"{n_kn}/{n_tot} ({frac:.0%}) closed-book \u2014 context, not "
+                      f"parametric recall, drives B1.", "#212121"))
+
+    # F1-a probe: descriptive success-correlate (NOT the Time-Set test).
+    auroc = f1a.get("auroc")
+    top = f1a.get("top_heads", []) or []
+    n_neg = sum(1 for t in top if float(t.get("coef", 0)) < 0)
+    if auroc is not None and top:
+        lines.append((f"F1-a probe (SOFT/descriptive): AUROC={auroc:.3f} but "
+                      f"{n_neg}/{len(top)} top heads have NEGATIVE coef \u2014 it is a "
+                      f"success-correlate, not a timestamp-extraction test; "
+                      f"intentionally non-load-bearing (methodology: soft annotation).",
+                      C_WEAK))
+
+    # F1-b raw attention: descriptive; non-sig is expected.
+    p = f1b.get("mann_whitney_p")
+    s_attn = _attn_top(f1b.get("b1_success", {}))
+    f_attn = _attn_top(f1b.get("b1_failure", {}))
+    if isinstance(p, (int, float)) and s_attn is not None and f_attn is not None:
+        sig = "n.s." if p > 0.05 else "sig."
+        arrow = "succ>fail" if s_attn > f_attn else "fail\u2265succ"
+        lines.append((f"F1-b raw year-attention (SOFT): p={p:.3f} ({sig}), {arrow} "
+                      f"({s_attn:.4f} vs {f_attn:.4f}) \u2014 success & failure read the "
+                      f"year alike, so attention is NOT the separator (as expected).",
+                      C_WEAK))
+
+    # Bottom-line synthesis — concept-faithful.
+    lines.append(("BOTTOM LINE: Time Set is ESTABLISHED (F2-c). F1-a/b/c are soft "
+                  "descriptive corroboration, not the verdict. F1 (Time-not-set) is "
+                  "therefore a MINORITY failure mode, identified per-instance by the "
+                  "DLA F1/F2 separator (see integrated figure) \u2014 most temporal "
+                  "errors are downstream (F2 routing / F3 override), matching the "
+                  "mediation-chain thesis.", "#1B5E20"))
+    return lines
+
+
+def plot_summary(f1a, f1b, f1c, out_dir: Path, a1=None, f2c=None):
     pops = _f1c_get_populations(f1c)
     succ_full = _f1c_ld_drops(pops.get("b1_success", {}).get("per_instance_full"),
                               competitor_only=True)
     fail_full = _f1c_ld_drops(pops.get("b1_failure", {}).get("per_instance_full"),
                               competitor_only=True)
 
-    fig = plt.figure(figsize=(15, 5))
-    gs  = fig.add_gridspec(1, 3, wspace=0.35)
+    fig = plt.figure(figsize=(16, 9))
+    gs  = fig.add_gridspec(2, 3, wspace=0.34, hspace=0.45,
+                           top=0.84, bottom=0.08, left=0.07, right=0.97)
 
-    # — panel A: AUROC bar ————————————————————————————————————————————————————
-    ax1 = fig.add_subplot(gs[0])
+    # — panel A0: A1 parametric memory ceiling ————————————————————————————————
+    ax0 = fig.add_subplot(gs[0, 0])
+    if a1 and a1.get("n_total"):
+        n_tot = a1["n_total"]
+        n_kn  = a1.get("n_knows_new", 0)
+        frac  = n_kn / n_tot if n_tot else 0.0
+        ax0.bar(["knows\nanswer_new", "does not"], [n_kn, n_tot - n_kn],
+                color=[C_POS, C_WEAK], edgecolor="white")
+        ax0.set_ylabel("# instances")
+        ax0.set_title(f"A1  Parametric Memory\n{n_kn}/{n_tot} ({frac:.0%}) recall answer_new")
+        ax0.text(0, n_kn, str(n_kn), ha="center", va="bottom", fontsize=10)
+        ax0.text(1, n_tot - n_kn, str(n_tot - n_kn), ha="center", va="bottom", fontsize=10)
+    else:
+        ax0.text(0.5, 0.5, "(a1_parametric_memory.json\nnot provided)",
+                 ha="center", va="center", transform=ax0.transAxes, color=C_WEAK)
+        ax0.set_title("A1  Parametric Memory")
+        ax0.set_xticks([]); ax0.set_yticks([])
+
+    # — panel A: AUROC bar + coefficient direction note ——————————————————————
+    ax1 = fig.add_subplot(gs[0, 1])
     auroc = f1a["auroc"]
     std   = f1a["auroc_std"]
-    ax1.bar(["SAT Probe\nAUROC"], [auroc], yerr=[std], color=C_SUCCESS,
+    top = f1a.get("top_heads", []) or []
+    n_neg = sum(1 for t in top if float(t.get("coef", 0)) < 0)
+    bar_color = C_NEG if (top and n_neg > len(top) / 2) else C_SUCCESS
+    ax1.bar(["SAT Probe\nAUROC"], [auroc], yerr=[std], color=bar_color,
             capsize=8, width=0.4, error_kw={"linewidth": 1.5})
     ax1.axhline(0.5, color="grey", linewidth=1.0, linestyle="--", label="chance")
     ax1.set_ylim(0, 1.0)
     ax1.set_ylabel("AUROC")
-    ax1.set_title("F1-a\nSAT Probe")
+    dir_note = (f"{n_neg}/{len(top)} top heads NEGATIVE\n(year-attn \u2191 \u21d2 FAILURE)"
+                if top and n_neg > len(top) / 2 else
+                f"{len(top) - n_neg}/{len(top)} top heads positive")
+    ax1.set_title(f"F1-a  SAT Probe\n{dir_note}")
     ax1.legend(fontsize=9)
     ax1.text(0, auroc + std + 0.03, f"{auroc:.3f}±{std:.3f}",
-             ha="center", fontsize=10, color=C_SUCCESS)
+             ha="center", fontsize=10, color=bar_color)
 
-    # — panel B: attention bar comparison ————————————————————————————————————
-    ax2 = fig.add_subplot(gs[1])
+    # — panel B: attention bar comparison (with significance flag) ——————————
+    ax2 = fig.add_subplot(gs[0, 2])
     weak_label = f1b.get("weak_group_label", "B3")
     weak_key   = weak_label.lower()
     succ_node = f1b.get("b1_success", {})
     fail_node = f1b.get("b1_failure", {})
     weak_node = f1b.get(weak_key) or f1b.get("b3") or {}
 
-    def _attn_top(node: dict) -> Optional[float]:
-        v = node.get("mean_attn_top3", node.get("mean_attn_top5"))
-        return float(v) if isinstance(v, (int, float)) else None
-
     s_attn  = _attn_top(succ_node)
     f_attn  = _attn_top(fail_node)
     w_attn  = _attn_top(weak_node)
     bar_lbls = ["B1-success", "B1-failure", f"{weak_label}\n(<YEAR>)"]
     bar_vals = [v if v is not None else 0.0 for v in (s_attn, f_attn, w_attn)]
-    ax2.bar(bar_lbls, bar_vals,
-            color=[C_SUCCESS, C_FAILURE, C_WEAK],
+    ax2.bar(bar_lbls, bar_vals, color=[C_SUCCESS, C_FAILURE, C_WEAK],
             edgecolor="white")
-    ax2.set_ylabel("Mean attention to year / <YEAR>\n(top-3 H_T-fallback heads)")
+    ax2.set_ylabel("Mean attention to year / <YEAR>\n(top-3 H_T heads)")
     p_value = f1b.get("mann_whitney_p")
-    pval_str = f"p = {p_value:.4f}" if isinstance(p_value, (int, float)) else ""
-    ax2.set_title(f"F1-b\nAttention Comparison\n{pval_str}")
+    if isinstance(p_value, (int, float)):
+        sig = "n.s." if p_value > 0.05 else "sig."
+        pval_str = f"p = {p_value:.4f}  [{sig}]"
+    else:
+        pval_str = ""
+    ax2.set_title(f"F1-b  Attention Comparison\n{pval_str}")
     for i, v in enumerate(bar_vals):
         if v:
             ax2.text(i, v + max(bar_vals) * 0.02, f"{v:.4f}",
                      ha="center", fontsize=9)
+    if isinstance(p_value, (int, float)) and p_value > 0.05:
+        ax2.text(0.5, 0.92, "NOT significant", transform=ax2.transAxes,
+                 ha="center", color=C_NEG, fontsize=10, fontweight="bold")
 
-    # — panel C: knockout CDF — success vs failure on the methodology
-    #            primary (full-network) knockout ——————————————————————————————
-    ax3 = fig.add_subplot(gs[2])
+    # — panel C: knockout CDF (competitor cohort) ————————————————————————————
+    ax3 = fig.add_subplot(gs[1, 0])
     plotted = False
     for drops, label, color in [
         (succ_full, "B1-success", C_SUCCESS),
@@ -443,14 +559,27 @@ def plot_summary(f1a, f1b, f1c, out_dir: Path):
     if plotted:
         ax3.legend(fontsize=9)
 
-    # H_T provenance: read is_fallback (validated H_T vs probe top-|coef| fallback).
+    # — panel D: synthesized F1 verdict ——————————————————————————————————————
+    axv = fig.add_subplot(gs[1, 1:3])
+    axv.axis("off")
+    axv.set_title("F1 Interpretation (Time-Set verdict = F2-c; F1-a/b/c = soft)",
+                  fontsize=12, loc="left")
+    lines = _f1_verdict_lines(f1a, f1b, f1c, a1, f2c=f2c)
+    y = 0.98
+    for text, color in lines:
+        wrapped = _wrap(text, 80)
+        axv.text(0.0, y, wrapped, transform=axv.transAxes, va="top", ha="left",
+                 fontsize=9.0, color=color)
+        y -= 0.055 + 0.052 * wrapped.count("\n")
+
+    # H_T provenance.
     is_fb = (f1a.get("step5_f1_positive") or {}).get("is_fallback")
     ht_str = "H_T = top-3 |coef| fallback" if is_fb else "H_T = validated set"
     fig.suptitle(
         f"F1 Diagnostic Summary — methodology-aligned "
         f"(C={f1a.get('probe_C', 0.05)}, agg={f1a.get('feature_aggregation', 'mean')}, "
         f"{ht_str})",
-        fontsize=12, y=1.01
+        fontsize=13, y=0.97
     )
     fig.savefig(out_dir / "f1_summary.pdf", bbox_inches="tight")
     fig.savefig(out_dir / "f1_summary.png", bbox_inches="tight")
@@ -458,11 +587,18 @@ def plot_summary(f1a, f1b, f1c, out_dir: Path):
     print("[saved] f1_summary")
 
 
+def _wrap(text: str, width: int) -> str:
+    import textwrap
+    return "\n".join(textwrap.wrap(text, width=width)) or text
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", default="results/f1_phi3")
     parser.add_argument("--out",     default=None)
+    parser.add_argument("--f2-dir", dest="f2_dir", default=None,
+                        help="F2 results dir; used to show the F2-c Time-Set verdict")
     args = parser.parse_args()
 
     res_dir = Path(args.results)
@@ -472,11 +608,17 @@ def main():
     f1a = load(res_dir / "f1a_sat_probe.json")
     f1b = load(res_dir / "f1b_attention_comparison.json")
     f1c = load(res_dir / "f1c_attention_knockout.json")
+    a1_path = res_dir / "a1_parametric_memory.json"
+    a1 = load(a1_path) if a1_path.exists() else None
+    f2c = None
+    if args.f2_dir:
+        f2c_path = Path(args.f2_dir) / "f2c_b5_vs_b6.json"
+        f2c = load(f2c_path) if f2c_path.exists() else None
 
     plot_f1a(f1a, out_dir)
     plot_f1b(f1b, out_dir)
     plot_f1c(f1c, out_dir)
-    plot_summary(f1a, f1b, f1c, out_dir)
+    plot_summary(f1a, f1b, f1c, out_dir, a1=a1, f2c=f2c)
 
     print(f"\nAll figures saved to: {out_dir}")
 

@@ -1332,13 +1332,19 @@ class F3aSummary:
     mid_window: tuple[int, int]
     late_window: tuple[int, int]
     counts_by_class: dict[str, int]
-    f3_traj_rate: dict[str, float]                # descriptive (lens_na-gated)
+    f3_traj_rate: dict[str, float]                # legacy mid-window (≈0 on late-crystallization)
     median_late_drop: dict[str, float]
     suppression_mean_by_class: dict[str, float]   # descriptive (Finding 4)
     lens_decodable_fraction: float                # Change 6 / Finding 3
     confirmed_stale_fraction: float               # LOWER BOUND over clean F3
     n_clean_f3: int                               # rank-guarded override cohort
     sweep_traj_rate: dict[str, dict[str, float]]  # {tau: {class: rate}}
+    # Data-driven readouts (late-crystallization-robust; what the figure should
+    # surface instead of the fixed mid-window f3_traj_rate):
+    #   suppression_rate     — fraction with is_suppression (peak-over-all → final drop)
+    #   rank_competitive_rate — fraction where answer_new ever became rank-competitive
+    suppression_rate: dict[str, float] = field(default_factory=dict)
+    rank_competitive_rate: dict[str, float] = field(default_factory=dict)
 
 
 def summarize_f3a_population(
@@ -1369,6 +1375,8 @@ def summarize_f3a_population(
             n_clean_f3=0,
             sweep_traj_rate={f"tau_{t:.2f}": {c: 0.0 for c in classes}
                              for t in F3A_TAU_SWEEP},
+            suppression_rate={c: 0.0 for c in classes},
+            rank_competitive_rate={c: 0.0 for c in classes},
         )
 
     n_layers = results[0].n_layers
@@ -1390,6 +1398,17 @@ def summarize_f3a_population(
     }
     suppression_mean = {
         c: (float(np.mean([r.suppression_drop for r in by_class.get(c, [])]))
+            if by_class.get(c) else 0.0)
+        for c in classes
+    }
+    suppression_rate = {
+        c: (float(np.mean([int(r.is_suppression) for r in by_class.get(c, [])]))
+            if by_class.get(c) else 0.0)
+        for c in classes
+    }
+    rank_competitive_rate = {
+        c: (float(np.mean([int(r.first_rank_competitive_layer >= 0)
+                           for r in by_class.get(c, [])]))
             if by_class.get(c) else 0.0)
         for c in classes
     }
@@ -1427,6 +1446,8 @@ def summarize_f3a_population(
         confirmed_stale_fraction=confirmed_stale_fraction,
         n_clean_f3=len(clean_f3),
         sweep_traj_rate=sweep,
+        suppression_rate=suppression_rate,
+        rank_competitive_rate=rank_competitive_rate,
     )
 
 

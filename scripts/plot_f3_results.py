@@ -3,15 +3,21 @@
 
 The default figure is the crystallization-robust SPINE (Changes 5/8):
 
-  Panel A  —  F3-a trajectory rates per param_class
-              (TEMPORAL_STALE_CONFIRMED / PARAM_AMBIGUOUS / PARAM_NEW),
-              annotated with ``lens_decodable`` and ``F3_clean (raw=M)``.
+  Panel A  —  F3-a data-driven suppression rate per param_class
+              (TEMPORAL_STALE_CONFIRMED / PARAM_AMBIGUOUS / PARAM_NEW) with the
+              rank-competitive overlay. The legacy fixed mid-window trajectory
+              rate is ≈0 under late crystallization and is shown only as a
+              footnote (the peak lands outside [L/4, 2L/3]).
   Panel B  —  F3-a Logit-Lens trajectories ``P^l(answer_new)`` — drawn ONLY when
               ``not lens_na`` (Finding 12.4); a placeholder otherwise.
-  Panel C  —  Failure-mode distribution (F1/F2/F3/MIXED), raw vs clean F3.
-  Panel D  —  Combined DLA localization + causal head-ablation Δ:
+  Panel C  —  Combined DLA localization + causal head-ablation Δ (full width):
               per-head DLA magnitudes (top-k) and the population Δ
               (failure − B1-success) with CI.
+
+The cross-cutting failure-mode taxonomy (F1/F2/F3) is deliberately NOT shown
+here — it is an F3-internal heuristic that conflicts with the authoritative
+per-diagnostic verdicts. The single authoritative taxonomy is rendered by
+``scripts/plot_integrated_results.py`` after F1/F2/F3 have all run.
 
 The legacy F3-0.5/b/c lattice figure is rendered separately only when the
 corresponding ``--hardening`` artifacts exist.
@@ -105,8 +111,20 @@ def _lens_na(f3a: dict | None) -> bool:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _rate_by_class(f3a: dict, field: str, predicate) -> dict[str, float]:
+    """Fallback: compute a per-class rate from per_instance when the summary
+    lacks the field (older result JSONs)."""
+    per = f3a.get("per_instance", []) or []
+    out: dict[str, float] = {}
+    for c in PARAM_CLASSES:
+        rows = [r for r in per if r.get("param_class") == c]
+        out[c] = (float(np.mean([int(bool(predicate(r))) for r in rows]))
+                  if rows else 0.0)
+    return out
+
+
 def panel_a(ax: plt.Axes, f3a: dict | None, modes: dict | None) -> None:
-    ax.set_title("F3-a trajectory rates by param_class")
+    ax.set_title("F3-a suppression rate by param_class")
     if not f3a:
         ax.text(0.5, 0.5, "(F3-a not run)", ha="center", va="center",
                 transform=ax.transAxes, color=C_GRAY)
@@ -115,27 +133,53 @@ def panel_a(ax: plt.Axes, f3a: dict | None, modes: dict | None) -> None:
         return
 
     summary = f3a.get("summary", {}) or {}
-    rates = [summary.get("f3_traj_rate", {}).get(c, 0.0) for c in PARAM_CLASSES]
+
+    # Primary signal = data-driven suppression rate (peak-over-all-layers → final
+    # drop), which is late-crystallization-robust. The legacy mid-window
+    # f3_traj_rate is ≈0 on late-crystallizing models (peak falls outside [L/4,2L/3])
+    # and is shown only as a footnote.
+    supp = summary.get("suppression_rate")
+    if not supp:
+        supp = _rate_by_class(f3a, "is_suppression", lambda r: r.get("is_suppression"))
+    rankc = summary.get("rank_competitive_rate")
+    if not rankc:
+        rankc = _rate_by_class(
+            f3a, "first_rank_competitive_layer",
+            lambda r: r.get("first_rank_competitive_layer", -1) >= 0)
+
+    rates = [supp.get(c, 0.0) for c in PARAM_CLASSES]
+    rc_rates = [rankc.get(c, 0.0) for c in PARAM_CLASSES]
     counts = [summary.get("counts_by_class", {}).get(c, 0) for c in PARAM_CLASSES]
     labels = [CLASS_SHORT[c] for c in PARAM_CLASSES]
-    bars = ax.bar(labels, rates, color=[CLASS_COLOR[c] for c in PARAM_CLASSES],
-                  edgecolor="black", linewidth=0.6)
-    for bar, count in zip(bars, counts):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
-                f"n={count}", ha="center", va="bottom", fontsize=8, color="black")
+    x = np.arange(len(PARAM_CLASSES))
 
-    ax.set_ylim(0, 1.0)
-    ax.set_ylabel("F3-trajectory rate (descriptive)")
+    bars = ax.bar(x, rates, color=[CLASS_COLOR[c] for c in PARAM_CLASSES],
+                  edgecolor="black", linewidth=0.6, label="suppression rate")
+    # Overlay rank-competitive ("was routed/decodable") as open markers.
+    ax.plot(x, rc_rates, "D", color="black", markersize=6,
+            markerfacecolor="white", label="rank-competitive rate")
+    for xi, bar, count, r in zip(x, bars, counts, rates):
+        ax.text(xi, bar.get_height() + 0.02, f"{r:.0%}\nn={count}",
+                ha="center", va="bottom", fontsize=8, color="black")
 
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("rate over class (descriptive)")
+    ax.legend(loc="lower right", framealpha=0.9, fontsize=7.5)
+
+    legacy = summary.get("f3_traj_rate", {}) or {}
+    legacy_max = max(legacy.values()) if legacy else 0.0
     lens_dec = summary.get("lens_decodable_fraction", 0.0)
     conf_stale = summary.get("confirmed_stale_fraction", 0.0)
     n_clean = summary.get("n_clean_f3", 0)
     raw = (modes or {}).get("counts_f3_raw", 0)
     note = (f"lens_decodable={lens_dec:.2f}  •  F3_clean={n_clean} (raw={raw})  •  "
-            f"confirmed_stale\u2265{conf_stale:.2f}")
+            f"confirmed_stale\u2265{conf_stale:.2f}\n"
+            f"legacy mid-window traj_rate(max)={legacy_max:.2f} "
+            f"(\u22480 under late crystallization \u2014 not the F3 signal)")
     if _lens_na(f3a):
         note += "  •  LENS_NA"
-    ax.set_xlabel(note, fontsize=8)
+    ax.set_xlabel(note, fontsize=7.5)
     _panel_label(ax, "A")
 
 
@@ -183,8 +227,11 @@ def panel_b(ax: plt.Axes, f3a: dict | None) -> None:
             continue
         n_drawn[cls] += 1
         probs = row.get("p_new", [])
-        alpha = 0.7 if row.get("is_f3_trajectory") else 0.18
-        lw = 1.0 if row.get("is_f3_trajectory") else 0.5
+        # Highlight the data-driven suppression trajectories (late-crystallization
+        # robust); the legacy is_f3_trajectory flag is ≈always False here.
+        highlight = row.get("is_suppression") or row.get("is_f3_trajectory")
+        alpha = 0.7 if highlight else 0.18
+        lw = 1.0 if highlight else 0.5
         ax.plot(range(len(probs)), probs, color=CLASS_COLOR[cls], alpha=alpha, lw=lw)
 
     if median_frc:
@@ -203,37 +250,15 @@ def panel_b(ax: plt.Axes, f3a: dict | None) -> None:
     _panel_label(ax, "B")
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Panel C — Failure-mode distribution (raw vs clean F3)
-# ─────────────────────────────────────────────────────────────────────
-
-
-def panel_modes(ax: plt.Axes, modes: dict | None) -> None:
-    ax.set_title("Failure-mode distribution (spine classifier)")
-    if not modes or not modes.get("counts"):
-        ax.text(0.5, 0.5, "(no f3a_failure_modes.json)", ha="center", va="center",
-                transform=ax.transAxes, color=C_GRAY)
-        ax.set_xticks([]); ax.set_yticks([])
-        _panel_label(ax, "C")
-        return
-    order = ["F1", "F2", "F3", "MIXED"]
-    counts = modes["counts"]
-    vals = [counts.get(k, 0) for k in order]
-    colors = [C_SKY, C_ORANGE, C_RED, C_GRAY]
-    bars = ax.bar(order, vals, color=colors, edgecolor="black", linewidth=0.6)
-    for bar, v in zip(bars, vals):
-        ax.text(bar.get_x() + bar.get_width() / 2, v, str(v),
-                ha="center", va="bottom", fontsize=9)
-    raw = modes.get("counts_f3_raw", 0)
-    suspect = modes.get("n_b1_scoring_suspect", 0)
-    ax.set_xlabel(f"F3 clean={counts.get('F3', 0)} (raw={raw})  •  "
-                  f"b1_scoring_suspect={suspect}", fontsize=8)
-    ax.set_ylabel("# B1-failure instances")
-    _panel_label(ax, "C")
+# NOTE: The cross-cutting failure-mode taxonomy (F1/F2/F3/MIXED) is intentionally
+# NOT plotted inside the F3 figure. That classifier is an F3-internal heuristic and
+# conflicts with the authoritative per-diagnostic verdicts (real F1-a, F2-DLA).
+# The single authoritative taxonomy lives in scripts/plot_integrated_results.py,
+# which joins the real F1/F2/F3 verdicts per instance after all stages have run.
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Panel D — Combined DLA localization + causal head-ablation Δ
+# Panel C — Combined DLA localization + causal head-ablation Δ
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -276,7 +301,7 @@ def panel_dla_delta(ax: plt.Axes, ablation: dict | None) -> None:
     box_color = C_GREEN if supported else C_GRAY
     ax.text(0.02, 0.97, txt, transform=ax.transAxes, va="top", ha="left",
             fontsize=8, bbox=dict(boxstyle="round", fc="white", ec=box_color, lw=1.4))
-    _panel_label(ax, "D")
+    _panel_label(ax, "C", x=-0.05)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -358,8 +383,7 @@ def render(results: Path, out_dir: Path, figsize: tuple[float, float]) -> None:
                            left=0.08, right=0.97, top=0.90, bottom=0.10)
     panel_a(fig.add_subplot(gs[0, 0]), f3a, modes)
     panel_b(fig.add_subplot(gs[0, 1]), f3a)
-    panel_modes(fig.add_subplot(gs[1, 0]), modes)
-    panel_dla_delta(fig.add_subplot(gs[1, 1]), ablation)
+    panel_dla_delta(fig.add_subplot(gs[1, :]), ablation)
     title_strip(fig, verdict)
 
     pdf_path = out_dir / "f3_results.pdf"
