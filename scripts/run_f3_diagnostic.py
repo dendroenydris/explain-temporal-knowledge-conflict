@@ -73,6 +73,7 @@ from tatm.f3_diagnosis import (  # noqa: E402
     run_f3a_trajectory,
     run_f3_half_bridge,
     run_f3_head_ablation,
+    run_f3_ld_gap,
     run_f3_late_window_intervention,
     run_f3b_ablation,
     run_f3c_step1_l_star,
@@ -438,6 +439,9 @@ def main() -> None:
                              "when lens_na (Finding 12.4).")
     parser.add_argument("--head-topk", type=int, default=4,
                         help="Cohort-level top-k DLA heads ablated on the spine (Change 3).")
+    parser.add_argument("--ld-gap-sample", type=int, default=None,
+                        help="Max instances for the clean success<->failure LD-gap "
+                             "probe (f3_ld_gap.json); None = all B1-labelled instances.")
 
     # Cross-experiment inputs.
     parser.add_argument("--temporal-heads", default=None,
@@ -631,6 +635,17 @@ def main() -> None:
         print(f"  top-k heads={head_ablation.top_k_heads}")
         print(f"  Δ(logit-diff) failure−success={head_ablation.delta:+.4f}  "
               f"CI={head_ablation.delta_CI}")
+
+        # Clean success<->failure logit-diff gaps (recovered-LD denominators
+        # for the causal mechanism profile — compute_causal_profile.py).
+        ld_gap = run_f3_ld_gap(
+            model, prepared, template=args.template,
+            max_instances=args.ld_gap_sample,
+        )
+        _write_json(out_dir / "f3_ld_gap.json", ld_gap)
+        print(f"  LD gap: new_old={ld_gap['gap_new_old']}  "
+              f"param_new={ld_gap['gap_param_new']}  "
+              f"(n_succ={ld_gap['n_success']}, n_fail={ld_gap['n_failure']})")
 
         verdict = assign_f3_verdict(
             f3a_summary, head_ablation, n_clean_f3=len(clean_f3),

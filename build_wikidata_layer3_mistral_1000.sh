@@ -22,6 +22,9 @@ export MODEL_TAG="${MODEL_TAG:-mistral}"
 export TEMPLATE="${TEMPLATE:-mistral}"
 export LAYERS="${LAYERS:-A1}"
 export OUT_JSONL="${OUT_JSONL:-data/processed/wikidata_layer3_${MODEL_TAG}_1000.jsonl}"
+# Mistral can emit short prompt-echo fragments before the final name; a larger
+# default budget reduces truncation into "Question: ..." fragments.
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-48}"
 
 if [ -n "${HF_TOKEN:-}" ]; then
   export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"

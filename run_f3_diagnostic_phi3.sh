@@ -211,6 +211,8 @@ if [ -n "${ELL_HT:-}" ]; then ARGS+=(--ell-HT "${ELL_HT}"); fi
 if [ -n "${TIMELINE_JSONL}" ]; then ARGS+=(--timeline-jsonl "${TIMELINE_JSONL}"); fi
 # Spine head-ablation top-k.
 ARGS+=(--head-topk "${HEAD_TOPK}")
+# Clean success<->failure LD-gap probe sample cap (empty = all B1-labelled).
+if [ -n "${LD_GAP_SAMPLE:-}" ]; then ARGS+=(--ld-gap-sample "${LD_GAP_SAMPLE}"); fi
 # Appendix lattice only when HARDENING=1.
 if [ "${HARDENING}" = "1" ]; then ARGS+=(--hardening); fi
 
@@ -331,6 +333,7 @@ required_z = [
     "f3a_trajectory.json",
     "f3a_partition.json",
     "f3_head_ablation.json",
+    "f3_ld_gap.json",
     "f3_verdict.json",
 ]
 if hardening:

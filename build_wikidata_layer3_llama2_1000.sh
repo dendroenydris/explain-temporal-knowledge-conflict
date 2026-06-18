@@ -22,6 +22,9 @@ export MODEL_TAG="${MODEL_TAG:-llama2}"
 export TEMPLATE="${TEMPLATE:-llama2}"
 export LAYERS="${LAYERS:-A1}"
 export OUT_JSONL="${OUT_JSONL:-data/processed/wikidata_layer3_${MODEL_TAG}_1000.jsonl}"
+# Llama-2 often emits a short preamble before the entity; 48 tokens avoids
+# truncating the actual answer when that happens.
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-48}"
 
 if [ -n "${HF_TOKEN:-}" ]; then export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"; fi
 

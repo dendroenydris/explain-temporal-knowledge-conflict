@@ -105,7 +105,8 @@ def build_concise_prompt(
     """Build a one-shot prompt that asks for only the answer string."""
     instruction = (
         "Answer each question with only the person's or entity's name. "
-        "Do not explain."
+        "Do not explain. "
+        "Output exactly one line in this format: Answer: <name>."
     )
     if context.strip():
         current = f"Context: {context}\n\nQuestion: {question}"
@@ -135,7 +136,8 @@ def build_concise_prompt(
             "<</SYS>>\n\n"
             f"Question: {ONE_SHOT_QUESTION}\n"
             f"Answer: {ONE_SHOT_ANSWER}\n\n"
-            f"{current} [/INST]"
+            f"{current}\n"
+            "Answer: [/INST]"
         )
     if template == "llama3":
         return (
@@ -154,7 +156,8 @@ def build_concise_prompt(
             f"[INST] {instruction}\n\n"
             f"Question: {ONE_SHOT_QUESTION}\n"
             f"Answer: {ONE_SHOT_ANSWER}\n\n"
-            f"{current} [/INST]"
+            f"{current}\n"
+            "Answer: [/INST]"
         )
 
     return (
@@ -169,9 +172,22 @@ def build_concise_prompt(
 def _strip_answer_text(text: str) -> str:
     """Normalize raw model output before extracting a short answer."""
     text = text.strip()
-    match = re.search(r"(?i)Answer\s*:\s*([^\n\r]+)", text)
-    if match:
-        text = match.group(1)
+
+    # Prefer the LAST "Answer: ..." marker anywhere in the output so leading
+    # chatter / prompt-echo ("Sure ...", "Question: ...") does not interfere.
+    markers = list(re.finditer(r"(?im)\b(?:final\s+)?answer\s*:\s*", text))
+    if markers:
+        extracted = ""
+        for marker in reversed(markers):
+            tail = text[marker.end():]
+            candidate = tail.split("\n", 1)[0]
+            for stop in ("<|", "[/INST]", "[INST]", "Instruction"):
+                candidate = candidate.split(stop)[0]
+            candidate = candidate.strip(" \t\r\n\"'")
+            if candidate:
+                extracted = candidate
+                break
+        text = extracted
     else:
         text = text.split("\n")[0]
     for stop in ("<|", "[", "Instruction"):
@@ -190,23 +206,59 @@ def _candidate_match(text: str, candidates: list[str]) -> str:
     for candidate in sorted_candidates:
         if candidate.lower() in clean:
             return candidate
-    for candidate in sorted_candidates:
-        if check_match(text, candidate):
-            return candidate
     return ""
 
 
 def extract_answer(text: str, candidates: list[str] | None = None) -> str:
     """Extract the first short answer phrase from raw generated text."""
+    raw_text = text
     text = _strip_answer_text(text)
     if candidates:
         matched = _candidate_match(text, candidates)
         if matched:
             return matched
 
+    # Llama-2 can start with chat boilerplate ("Sure! Here are the answers...")
+    # and get truncated before any actual entity appears. Treat this as empty
+    # extraction instead of a misleading phrase.
+    lower = text.lower().strip()
+    if (
+        "here are the answers to your questions" in lower
+        or lower.startswith("sure")
+        or lower.startswith("here are")
+        or lower.startswith("question:")
+    ):
+        # Last chance: sometimes the raw output still contains a candidate name.
+        if candidates:
+            matched_raw = _candidate_match(raw_text, candidates)
+            if matched_raw:
+                return matched_raw
+        return ""
+
     # Phi-3 often answers with "As of 2018, the ... was X"; keep only X.
     text = re.sub(r"(?i)^as of\s+(?:19|20)\d{2},?\s*", "", text).strip()
     text = re.sub(r"(?i)^the answer is\s+", "", text).strip()
+    text = re.sub(r"(?i)^answer\s*:\s*", "", text).strip()
+
+    # Guard against non-answer templates / uncertainty replies.
+    invalid_prefixes = (
+        "question:",
+        "not specified",
+        "unknown",
+        "the director or manager of",
+        "the officeholder associated",
+        "the head coach of",
+        "the ceo of",
+        "the head of government of",
+        "the head of state of",
+    )
+    lower_clean = text.lower()
+    if any(lower_clean.startswith(p) for p in invalid_prefixes):
+        if candidates:
+            matched_raw = _candidate_match(raw_text, candidates)
+            if matched_raw:
+                return matched_raw
+        return ""
 
     subject_answer_match = re.match(
         r"^(.+?)\s+(?:was|is|were|are)\s+(?:the\s+)?"
@@ -262,16 +314,20 @@ def _trim_answer_tail(text: str) -> str:
         flags=re.IGNORECASE,
     )[0]
 
-    # Only treat a period as a sentence boundary when it is not part of a known
-    # title/honorific and is followed by whitespace plus a new sentence.
+    # Only treat a period as a sentence boundary when it follows lowercase text
+    # and starts a new sentence.  This preserves initials like "J.C.R. Licklider"
+    # and "Jane M. Xiang".
     sentence_boundary = re.search(
-        r"(?<!\bDr)(?<!\bMr)(?<!\bMs)(?<!\bMrs)(?<!\bProf)(?<!\bHon)(?<!\bRt Hon)\.\s+[A-Z]",
+        r"(?<=[a-z])\.\s+[A-Z]",
         text,
     )
     if sentence_boundary:
         text = text[: sentence_boundary.start() + 1]
 
-    return text.strip(" ,.")
+    text = text.strip(" ,")
+    if text.endswith(".") and len(text) >= 2 and text[-2].islower():
+        text = text[:-1]
+    return text
 
 
 def generate_raw_answer(model, prompt: str, max_new_tokens: int) -> str:
@@ -339,6 +395,15 @@ def main() -> None:
         "--dtype", default="auto", choices=["auto", "float16", "float32", "bfloat16"],
     )
     args = parser.parse_args()
+
+    # Llama-2/Mistral frequently emit a short preamble before the actual entity.
+    # Keep a larger generation budget by default unless explicitly overridden.
+    if (
+        args.max_new_tokens == 16
+        and args.template in {"llama2", "mistral"}
+        and "--max-new-tokens" not in sys.argv
+    ):
+        args.max_new_tokens = 48
 
     layer2_path = Path(args.layer2)
     out_path = Path(args.out)

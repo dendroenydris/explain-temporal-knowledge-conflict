@@ -1190,6 +1190,81 @@ def run_f3_head_ablation(
     )
 
 
+def run_f3_ld_gap(
+    model: HookedTransformer,
+    prepared: Sequence[F3PreparedInstance],
+    *,
+    template: str = "phi3",
+    max_instances: Optional[int] = None,
+    verbose: bool = True,
+) -> dict:
+    """Clean (un-ablated) raw final-position logit-diffs, split by B1 outcome.
+
+    Produces the **success<->failure gap** denominators that normalize the F1/F2/F3
+    causal effects into recovered-logit-difference fractions (Wang et al. 2023;
+    Heimersheim & Nanda 2024). Two contrasts are logged because the axes live in
+    different sub-spaces:
+
+      * ``ld_new_old   = logit(answer_new) - logit(answer_old)``  -> F1, F2 axes
+      * ``ld_param_new = logit(a_param)    - logit(answer_new)``  -> F3 axis
+
+    The gap is the success/failure difference of the matching contrast:
+    ``gap_new_old   = mean(ld_new_old | B1-success)   - mean(ld_new_old | failure)``
+    ``gap_param_new = mean(ld_param_new | failure) - mean(ld_param_new | B1-success)``
+    (signed so each gap is the "clean -> corrupt" span the interventions move).
+    One forward pass per instance, no grad — cheap.
+    """
+    rows = [i for i in prepared if i.b1_success is not None]
+    if max_instances is not None and len(rows) > max_instances:
+        rng = _random.Random(0)
+        rows = rng.sample(rows, max_instances)
+
+    rec = {"success": {"new_old": [], "param_new": []},
+           "failure": {"new_old": [], "param_new": []}}
+    n_no_old = 0
+    for inst in tqdm(rows, desc="F3 LD-gap probe", disable=not verbose,
+                     unit="inst", dynamic_ncols=True):
+        old_tid = get_first_answer_token(model, inst.answer_old) if inst.answer_old else -1
+        prompt = build_prompt(
+            str(inst.row.get("context", "")), str(inst.row.get("question", "")),
+            template=template,
+        )
+        tokens = model.to_tokens(prompt, prepend_bos=False)
+        targets = [inst.answer_new_tid, inst.a_param_tid,
+                   old_tid if old_tid >= 0 else inst.answer_new_tid]
+        logits, _ = _final_logits_with_hooks(model, tokens, targets, hooks=[])
+        l_new, l_param, l_old = float(logits[0]), float(logits[1]), float(logits[2])
+        arm = "success" if inst.b1_success else "failure"
+        rec[arm]["param_new"].append(l_param - l_new)
+        if old_tid >= 0:
+            rec[arm]["new_old"].append(l_new - l_old)
+        else:
+            n_no_old += 1
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _m(xs):
+        return float(np.mean(xs)) if xs else None
+
+    s_no, f_no = rec["success"]["new_old"], rec["failure"]["new_old"]
+    s_pn, f_pn = rec["success"]["param_new"], rec["failure"]["param_new"]
+    gap_new_old = (_m(s_no) - _m(f_no)) if (s_no and f_no) else None
+    gap_param_new = (_m(f_pn) - _m(s_pn)) if (s_pn and f_pn) else None
+    return {
+        "contrasts": {
+            "new_old": "logit(answer_new) - logit(answer_old)  [F1, F2 axes]",
+            "param_new": "logit(a_param) - logit(answer_new)    [F3 axis]",
+        },
+        "n_success": len(s_pn), "n_failure": len(f_pn), "n_no_answer_old": n_no_old,
+        "mean_new_old_success": _m(s_no), "mean_new_old_failure": _m(f_no),
+        "mean_param_new_success": _m(s_pn), "mean_param_new_failure": _m(f_pn),
+        "gap_new_old": gap_new_old,
+        "gap_param_new": gap_param_new,
+        "note": ("gap = clean->corrupt (success->failure) span; divide a causal "
+                 "effect by the matching gap for a recovered-LD fraction."),
+    }
+
+
 # ── F3-a population-level summary + positive-control verdict ────────────────
 
 
@@ -3384,6 +3459,7 @@ __all__ = [
     # Phase entries
     "run_f3a_trajectory", "summarize_f3a_population",
     "run_f3_head_ablation",
+    "run_f3_ld_gap",
     "run_f3_late_window_intervention",
     "run_f3_half_bridge",
     "run_f3b_ablation",
