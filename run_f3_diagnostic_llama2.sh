@@ -26,13 +26,15 @@ export OUT_DIR="${OUT_DIR:-results/f3_diagnostic_1000_${MODEL_TAG}}"
 export RUN_M_PROTOCOL="${RUN_M_PROTOCOL:-0}"
 
 MODEL_NAME="${MODEL_NAME:-Llama-2-7b-chat-hf}"
-EAP_HEADS_FILE="${EAP_HEADS_FILE:-results/eap_circuits/${MODEL_NAME}/discovered_temporal_heads.json}"
+# Canonical temporal-heads file (paper_temporal_heads.json holds Llama-2 heads
+# directly from Park et al. [13] Table 2 / Figure 9; no separate EAP run needed).
+HEADS_FILE="${HEADS_FILE:-data/external/temporal_heads/paper_temporal_heads.json}"
 
 if [ -n "${HF_TOKEN:-}" ]; then export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"; fi
 
-# Derive TEMPORAL_HEADS ("l:h,l:h,...") from the EAP discovery file unless set.
-if [ -z "${TEMPORAL_HEADS:-}" ] && [ -f "${EAP_HEADS_FILE}" ] && command -v python3 >/dev/null; then
-  TEMPORAL_HEADS=$(python3 - "${EAP_HEADS_FILE}" "${MODEL_NAME}" <<'PY'
+# Derive TEMPORAL_HEADS ("l:h,l:h,...") from the canonical file unless already set.
+if [ -z "${TEMPORAL_HEADS:-}" ] && [ -f "${HEADS_FILE}" ] && command -v python3 >/dev/null; then
+  TEMPORAL_HEADS=$(python3 - "${HEADS_FILE}" "${MODEL_NAME}" <<'PY'
 import json, sys
 path, name = sys.argv[1], sys.argv[2].lower()
 d = json.load(open(path))
@@ -52,11 +54,12 @@ print(",".join(pairs))
 PY
 )
   export TEMPORAL_HEADS
-  echo "[OK] TEMPORAL_HEADS from EAP: ${TEMPORAL_HEADS}"
+  echo "[OK] TEMPORAL_HEADS from ${HEADS_FILE}: ${TEMPORAL_HEADS}"
 fi
 if [ -z "${TEMPORAL_HEADS:-}" ]; then
-  echo "[ERROR] No TEMPORAL_HEADS for ${MODEL_NAME}. Run run_eap_llama2.sh first, " \
-       "or pass TEMPORAL_HEADS=\"l:h,l:h\" explicitly." >&2
+  echo "[ERROR] Could not derive TEMPORAL_HEADS for ${MODEL_NAME} from ${HEADS_FILE}." >&2
+  echo "  Ensure paper_temporal_heads.json contains a 'llama2-7b-chat-hf' entry," >&2
+  echo "  or pass TEMPORAL_HEADS=\"l:h,l:h,...\" explicitly." >&2
   exit 1
 fi
 

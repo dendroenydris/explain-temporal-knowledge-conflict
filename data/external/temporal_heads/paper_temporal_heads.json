@@ -1,6 +1,6 @@
 {
   "source": "[13] Does Time Have Its Place? Temporal Heads: Where Language Models Recall Time-specific Information",
-  "notes": "For each model, top_heads lists the primary temporal heads first, followed by backup temporal heads reported in the paper figures.",
+  "notes": "For each model, top_heads lists the primary temporal heads first, followed by backup temporal heads.\n\n- For models covered by the paper, entries come directly from the paper (coef = 'paper_table_2' / 'paper_figure_N').\n- For Mistral-7B-Instruct-v0.1, the paper does NOT report temporal heads; we include an EAP-IG self-discovered H_T set (coef = numeric temporal-relevance score).",
   "models": {
     "llama2-7b-chat-hf": {
       "model": "meta-llama/Llama-2-7b-chat-hf",
@@ -86,6 +86,119 @@
           "head": 0,
           "coef": "paper_figure_11",
           "label": "backup_temporal_head"
+        }
+      ]
+    },
+    "mistral-7b-instruct-v0.1": {
+      "model": "mistralai/Mistral-7B-Instruct-v0.1",
+      "provenance": {
+        "source": "EAP-IG self-discovered (scripts/run_eap_circuit.py)",
+        "origin_file": "results3/eap_circuits/Mistral-7B-Instruct-v0.1/discovered_temporal_heads.json",
+        "paper_covers_model": false,
+        "method": "EAP-IG circuit; heads ranked by temporal relevance = mean(normalized score over temporal circuits) - mean(over invariant circuits)",
+        "config": {
+          "years": [
+            "1999",
+            "2004",
+            "2009"
+          ],
+          "ig_steps": 50,
+          "threshold": 0.1,
+          "threshold_ratio": 0.9,
+          "max_pairs": 20,
+          "top_k": 8
+        },
+        "note": "This is the PRIMARY H_T source for Mistral in this project (no external ground truth from the paper). Use the first entry as H_T; remaining entries are backup heads."
+      },
+      "top_heads": [
+        {
+          "layer": 17,
+          "head": 3,
+          "coef": 0.66562,
+          "label": "temporal_head_discovered",
+          "temporal_score": 0.71429,
+          "invariant_score": 0.04866,
+          "temporal_freq": 0.714,
+          "strict_temporal_only": false,
+          "role": "H_T (primary temporal head)",
+          "note": "Strongest temporal exclusivity (~9.4x temporal/invariant ratio)."
+        },
+        {
+          "layer": 9,
+          "head": 16,
+          "coef": 0.17132,
+          "label": "backup_temporal_head_discovered",
+          "temporal_score": 0.19602,
+          "invariant_score": 0.02469,
+          "temporal_freq": 0.714,
+          "strict_temporal_only": false,
+          "role": "H_T_bu (backup temporal head)"
+        },
+        {
+          "layer": 18,
+          "head": 27,
+          "coef": 0.16851,
+          "label": "backup_temporal_head_discovered",
+          "temporal_score": 0.18485,
+          "invariant_score": 0.01634,
+          "temporal_freq": 0.714,
+          "strict_temporal_only": false,
+          "role": "H_T_bu (backup temporal head)"
+        },
+        {
+          "layer": 9,
+          "head": 17,
+          "coef": 0.14113,
+          "label": "backup_temporal_head_discovered",
+          "temporal_score": 0.16919,
+          "invariant_score": 0.02806,
+          "temporal_freq": 0.714,
+          "strict_temporal_only": false,
+          "role": "H_T_bu (backup temporal head)"
+        },
+        {
+          "layer": 7,
+          "head": 31,
+          "coef": 0.12608,
+          "label": "backup_temporal_head_discovered",
+          "temporal_score": 0.20639,
+          "invariant_score": 0.08032,
+          "temporal_freq": 0.714,
+          "strict_temporal_only": false,
+          "role": "H_T_bu (backup temporal head)"
+        },
+        {
+          "layer": 4,
+          "head": 3,
+          "coef": 0.11586,
+          "label": "backup_temporal_head_discovered",
+          "temporal_score": 0.14606,
+          "invariant_score": 0.0302,
+          "temporal_freq": 0.714,
+          "strict_temporal_only": false,
+          "role": "H_T_bu (backup temporal head)"
+        },
+        {
+          "layer": 17,
+          "head": 27,
+          "coef": 0.10133,
+          "label": "backup_temporal_head_discovered",
+          "temporal_score": 0.12141,
+          "invariant_score": 0.02008,
+          "temporal_freq": 0.714,
+          "strict_temporal_only": false,
+          "role": "H_T_bu (backup temporal head)"
+        },
+        {
+          "layer": 9,
+          "head": 18,
+          "coef": 0.09251,
+          "label": "backup_temporal_head_discovered",
+          "temporal_score": 0.11973,
+          "invariant_score": 0.02722,
+          "temporal_freq": 0.714,
+          "strict_temporal_only": false,
+          "role": "H_T_bu (backup temporal head)"
         }
       ]
     }

@@ -20,7 +20,7 @@ export MODEL="${MODEL:-meta-llama/Llama-2-7b-chat-hf}"
 export MODEL_TAG="${MODEL_TAG:-llama2}"
 export TEMPLATE="${TEMPLATE:-llama2}"
 export OUT_DIR="${OUT_DIR:-results/f1_diagnostic_1000_${MODEL_TAG}}"
-export TEMPORAL_HEADS_FILE="${TEMPORAL_HEADS_FILE:-results/eap_circuits/Llama-2-7b-chat-hf/discovered_temporal_heads.json}"
+export TEMPORAL_HEADS_FILE="${TEMPORAL_HEADS_FILE:-data/external/temporal_heads/paper_temporal_heads.json}"
 
 if [ -n "${HF_TOKEN:-}" ]; then export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"; fi
 

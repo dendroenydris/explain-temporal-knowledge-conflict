@@ -65,7 +65,7 @@ from tatm.f3_diagnosis import (  # noqa: E402
     F3PreparedInstance,
     assign_f3_verdict,
     build_f3_pair_prompts,
-    classify_failure_mode,
+    is_f3_cohort,
     load_layer3_by_key,
     load_timelines,
     partition_b1_success_pool,
@@ -79,7 +79,6 @@ from tatm.f3_diagnosis import (  # noqa: E402
     run_f3c_step2_3,
     run_f3c_step4_content,
     summarize_f3a_population,
-    summarize_failure_modes,
     to_jsonable,
 )
 from tatm.model import build_prompt, generate_answer, load_model  # noqa: E402
@@ -591,18 +590,10 @@ def main() -> None:
               f"{f3a_summary.confirmed_stale_fraction:.3f}")
         print(f"  n_clean_f3={f3a_summary.n_clean_f3}")
         print(f"  traj rates (descriptive): {f3a_summary.f3_traj_rate}")
-
-        # Behavioral F1/F2/F3/MIXED distribution (rank-guarded classifier).
-        mode_summary = summarize_failure_modes(f3a_results)
-        _write_json(out_dir / "f3a_failure_modes.json", mode_summary)
-        print("\n[F3-a] Failure-mode distribution (behavioral anchor):")
-        print(f"  counts (clean): {mode_summary.counts}")
-        print(f"  behavioral_f3_rate raw={mode_summary.behavioral_f3_rate:.3f} "
-              f"(n={mode_summary.counts_f3_raw}) "
-              f"clean={mode_summary.behavioral_f3_rate_clean:.3f} "
-              f"(n={mode_summary.f3_cohort_n})")
-        print(f"  b1_scoring_suspect (rank0 but scored failure)="
-              f"{mode_summary.n_b1_scoring_suspect}")
+        # NOTE: the population F1/F2/F3/MIXED hard-taxonomy deliverable
+        # (f3a_failure_modes.json) has been retired in favour of the graded
+        # mechanism-propensity decomposition — see
+        # scripts/compute_mechanism_propensity.py + methodology Part III.
 
     # ── Partitions on B1-success (null population for the spine) ───────
     partitions = partition_b1_success_pool(
@@ -625,7 +616,7 @@ def main() -> None:
         clean_f3 = [
             i for i in prepared
             if res_by_id.get(i.instance_id) is not None
-            and classify_failure_mode(res_by_id[i.instance_id]) == "F3"
+            and is_f3_cohort(res_by_id[i.instance_id])
         ]
         # B1-success population control (Finding 2/10): Partition C primary,
         # fall back to the whole B1-success population if C is empty.

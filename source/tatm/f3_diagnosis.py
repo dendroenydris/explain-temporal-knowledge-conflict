@@ -763,119 +763,33 @@ def run_f3a_trajectory(
     return results
 
 
-# ── Behavioral-anchor F1/F2/F3 classifier (measurable redesign) ─────────────
+# ── F3 causal-test cohort gate ──────────────────────────────────────────────
+# The population-level F1/F2/F3/MIXED *hard taxonomy* (the old
+# ``classify_failure_mode`` 4-way labeller + ``summarize_failure_modes``
+# distribution / ``f3a_failure_modes.json``) has been RETIRED. Single-label
+# classification forces mutually-exclusive buckets that the mechanisms do not
+# obey (competition of mechanisms / superposition); the graded
+# mechanism-propensity decomposition (methodology Part III +
+# ``scripts/compute_mechanism_propensity.py``) replaces it. The only thing the
+# pipeline still needs is the binary F3-cohort gate below, used to select the
+# instances the head-ablation *causal* test runs on.
 
 
-def classify_failure_mode(
-    r: "F3aTrajectoryResult",
-    *,
-    rank_thr: int = F3A_RANK_COMPETITIVE,
-) -> str:
-    """Assign F1 / F2 / F3 / MIXED to a B1-failure instance (behavioral_primary).
+def is_f3_cohort(r: "F3aTrajectoryResult") -> bool:
+    """F3 causal-test cohort membership (narrowed from the retired classifier).
 
-    Precedence (methodology F3 measurable redesign):
-
-    1. **F3 — "Time Routed but Overridden"**: anchored on the behavioral
-       ground truth ``b1_outputs_param`` (the model actually emitted
-       ``a_param``).  Behaviour wins over trajectory shape: an instance whose
-       trajectory peaks-then-drops but that did *not* emit ``a_param`` is
-       *not* F3 (it falls through to F2 / MIXED).  The trajectory
-       (``is_suppression`` / ``suppression_drop``) is the mechanistic
-       *explanation* of F3, never the classifier.
-    2. **F1 — "Time Not Set"**: ``answer_new`` never becomes rank-competitive
-       (top-``rank_thr``) at any layer — it never entered the readout.
-    3. **F2 — "Set but Not Routed"**: ``answer_new`` became rank-competitive
-       at some layer (the information formed) but never reached the output and
-       the model did not emit ``a_param``.
-    4. **MIXED / Unresolved**: anything that does not fit cleanly (e.g.
-       competitive *and* final-dominant yet still scored a failure).
-
-    ``b1_success`` instances return ``"SUCCESS"`` (not part of the failure
-    taxonomy).
+    True iff the instance is a genuine "Routed but Overridden" candidate: a
+    B1-failure where the model emitted ``a_param`` AND ``answer_new`` was
+    genuinely suppressed (``rank_new_final != 0``). The rank guard excludes
+    PARAM_NEW first-token collisions (``answer_new`` actually won, rank 0) that
+    would otherwise inflate the cohort (Finding 1 / Change 1). The trajectory
+    (``is_suppression`` / ``suppression_drop``) is the mechanistic *explanation*
+    of F3, never the gate. Used only to select the head-ablation cohort and the
+    confirmed-stale lower bound.
     """
     if r.b1_success:
-        return "SUCCESS"
-    # F3 requires the model to have emitted a_param AND answer_new to have been
-    # genuinely suppressed (rank_new_final != 0).  Without the rank guard the
-    # PARAM_NEW first-token collisions (answer_new actually won, rank 0) inflate
-    # the F3 cohort (Finding 1 / Change 1).
-    if r.b1_outputs_param and r.rank_new_final != 0:
-        return "F3"
-    routed = r.first_rank_competitive_layer >= 0
-    if not routed:
-        return "F1"
-    if r.rank_new_final != 0:
-        return "F2"
-    return "MIXED"
-
-
-@dataclass
-class FailureModeSummary:
-    """Population-level F1/F2/F3/MIXED distribution + F3 mechanism hit-rate."""
-    counts: dict             # {mode: n} — corrected (rank-guarded) classifier
-    rates: dict              # {mode: fraction of failures}
-    n_failures: int
-    # Among the behavioral F3 cohort (b1_outputs_param), the fraction that
-    # ALSO show the late rise-then-drop suppression signature.  This is the
-    # numerator of the F3 mechanism claim (methodology F3-a).
-    f3_mechanism_hit_rate: Optional[float]
-    f3_cohort_n: int                  # = clean F3 cohort n (rank-guarded)
-    counts_by_param_class: dict  # {param_class: {mode: n}}
-    # Transparency (Finding 1 / Change 1): the OLD (pre-rank-guard) F3 count
-    # — every B1-failure with ``b1_outputs_param`` — vs the corrected clean count.
-    counts_f3_raw: int = 0
-    behavioral_f3_rate: float = 0.0        # raw / n_failures
-    behavioral_f3_rate_clean: float = 0.0  # clean / n_failures
-    # rank_new_final == 0 (answer_new actually won) yet B1 scored a failure ⇒
-    # a possible RougeL b1_success threshold issue (investigate separately).
-    n_b1_scoring_suspect: int = 0
-
-
-def summarize_failure_modes(
-    results: Sequence["F3aTrajectoryResult"],
-    *,
-    rank_thr: int = F3A_RANK_COMPETITIVE,
-) -> FailureModeSummary:
-    """Aggregate per-instance failure modes into the Part III distribution."""
-    counts: dict[str, int] = {}
-    by_class: dict[str, dict[str, int]] = {}
-    f3_total = 0
-    f3_raw_total = 0
-    f3_with_mechanism = 0
-    n_failures = 0
-    n_suspect = 0
-    for r in results:
-        mode = classify_failure_mode(r, rank_thr=rank_thr)
-        if mode == "SUCCESS":
-            continue
-        n_failures += 1
-        counts[mode] = counts.get(mode, 0) + 1
-        cls = by_class.setdefault(r.param_class, {})
-        cls[mode] = cls.get(mode, 0) + 1
-        # Raw (pre-rank-guard) F3: every B1-failure that emitted a_param.
-        if r.b1_outputs_param:
-            f3_raw_total += 1
-        if mode == "F3":
-            f3_total += 1
-            if r.is_suppression:
-                f3_with_mechanism += 1
-        # answer_new won (rank 0) yet scored a failure ⇒ scoring suspect.
-        if r.rank_new_final == 0 and r.b1_success is False:
-            n_suspect += 1
-    rates = {k: (v / n_failures if n_failures else 0.0) for k, v in counts.items()}
-    hit_rate = (f3_with_mechanism / f3_total) if f3_total else None
-    return FailureModeSummary(
-        counts=counts,
-        rates=rates,
-        n_failures=n_failures,
-        f3_mechanism_hit_rate=hit_rate,
-        f3_cohort_n=f3_total,
-        counts_by_param_class=by_class,
-        counts_f3_raw=f3_raw_total,
-        behavioral_f3_rate=(f3_raw_total / n_failures if n_failures else 0.0),
-        behavioral_f3_rate_clean=(f3_total / n_failures if n_failures else 0.0),
-        n_b1_scoring_suspect=n_suspect,
-    )
+        return False
+    return bool(r.b1_outputs_param) and r.rank_new_final != 0
 
 
 # ── F3 causal main line: late-window SPAN intervention ──────────────────────
@@ -1416,7 +1330,7 @@ def summarize_f3a_population(
     lens_decodable_fraction = float(np.mean([int(_is_lens_decodable(r)) for r in results]))
 
     # Confirmed-stale LOWER BOUND over the clean (rank-guarded) F3 cohort.
-    clean_f3 = [r for r in results if classify_failure_mode(r, rank_thr=rank_thr) == "F3"]
+    clean_f3 = [r for r in results if is_f3_cohort(r)]
     confirmed_stale_fraction = (
         float(np.mean([int(r.param_class == "TEMPORAL_STALE_CONFIRMED")
                        for r in clean_f3]))
@@ -3457,12 +3371,12 @@ __all__ = [
     "LStarResult", "F3cInstance", "F3cResult",
     "F3cContentInstance", "F3cContentResult", "F3Verdict",
     "SublayerProbs",
-    "FailureModeSummary", "F3InterventionResult", "F3InterventionSummary",
+    "F3InterventionResult", "F3InterventionSummary",
     "F3HeadAblationResult",
     # Helpers
     "mid_window", "late_window", "alignment_k",
     "peak_over_all_layers", "suppression_drop", "first_rank_competitive_layer",
-    "classify_failure_mode", "summarize_failure_modes",
+    "is_f3_cohort",
     "compute_sublayer_probs",
     # IO
     "load_layer3_by_key", "load_timelines", "prepare_f3_instances",

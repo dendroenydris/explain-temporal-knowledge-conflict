@@ -329,7 +329,6 @@ run_m = hardening and "${RUN_M_PROTOCOL}" == "1"
 required_z = [
     "f3_manifest.json",
     "f3a_trajectory.json",
-    "f3a_failure_modes.json",
     "f3a_partition.json",
     "f3_head_ablation.json",
     "f3_verdict.json",
