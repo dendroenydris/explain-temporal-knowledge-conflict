@@ -785,7 +785,7 @@ def main():
         help="How many top heads to use from probe JSON (default: 10)",
     )
     parser.add_argument("--template", default="plain",
-                        choices=["plain", "llama2", "llama3", "phi3", "qwen"])
+                        choices=["plain", "llama2", "llama3", "mistral", "phi3", "qwen"])
     parser.add_argument("--out", default="results/f2_diagnostic", help="Output directory")
     parser.add_argument("--device", default="auto", help="cuda | mps | cpu | auto")
     parser.add_argument(

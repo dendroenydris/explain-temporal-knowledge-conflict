@@ -149,6 +149,13 @@ def build_concise_prompt(
             f"{current}<|eot_id|>"
             "<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
+    if template == "mistral":
+        return (
+            f"[INST] {instruction}\n\n"
+            f"Question: {ONE_SHOT_QUESTION}\n"
+            f"Answer: {ONE_SHOT_ANSWER}\n\n"
+            f"{current} [/INST]"
+        )
 
     return (
         f"{instruction}\n\n"
@@ -307,7 +314,7 @@ def main() -> None:
     parser.add_argument(
         "--template",
         default="phi3",
-        choices=["plain", "llama2", "llama3", "phi3", "qwen"],
+        choices=["plain", "llama2", "llama3", "mistral", "phi3", "qwen"],
     )
     parser.add_argument(
         "--layers",

@@ -171,7 +171,7 @@ def main() -> None:
     parser.add_argument("--layer3", default=str(DEFAULT_LAYER3))
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     parser.add_argument("--model", default="microsoft/phi-3-mini-4k-instruct")
-    parser.add_argument("--template", default="phi3", choices=["plain", "llama2", "llama3", "phi3", "qwen"])
+    parser.add_argument("--template", default="phi3", choices=["plain", "llama2", "llama3", "mistral", "phi3", "qwen"])
     parser.add_argument("--layers", nargs="+", default=["B1"], help="Layer-2 prefixes to generate, e.g. B1 B5 B6")
     parser.add_argument("--max-instances", type=int, default=None)
     parser.add_argument("-n", "--number", type=int, default=None)

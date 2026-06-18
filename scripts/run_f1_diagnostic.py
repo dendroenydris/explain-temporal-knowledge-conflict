@@ -1162,7 +1162,7 @@ def main():
         "--model", default="meta-llama/Llama-2-7b-chat-hf",
         help="HuggingFace model name (must be supported by TransformerLens)",
     )
-    parser.add_argument("--template", default="plain", choices=["plain", "llama2", "llama3", "phi3"])
+    parser.add_argument("--template", default="plain", choices=["plain", "llama2", "llama3", "mistral", "phi3"])
     parser.add_argument("--out", default="results/f1_diagnostic", help="Output directory")
     parser.add_argument(
         "--layer3",

@@ -408,7 +408,7 @@ def main() -> None:
                              "Absent ⇒ confirmation falls back to single answer_old.")
     parser.add_argument("--model", default="microsoft/phi-3-mini-4k-instruct")
     parser.add_argument("--template", default="phi3",
-                        choices=["plain", "llama2", "llama3", "phi3", "qwen"])
+                        choices=["plain", "llama2", "llama3", "mistral", "phi3", "qwen"])
     parser.add_argument("--out", default="results/f3_diagnostic")
     parser.add_argument("--device", default="auto", help="cuda | mps | cpu | auto")
     parser.add_argument("--dtype", default="float32",
