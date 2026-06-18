@@ -315,13 +315,18 @@ def _trim_answer_tail(text: str) -> str:
     )[0]
 
     # Only treat a period as a sentence boundary when it follows lowercase text
-    # and starts a new sentence.  This preserves initials like "J.C.R. Licklider"
-    # and "Jane M. Xiang".
-    sentence_boundary = re.search(
-        r"(?<=[a-z])\.\s+[A-Z]",
-        text,
-    )
-    if sentence_boundary:
+    # and starts a new sentence, while skipping common honorific abbreviations.
+    # This avoids truncating names like "Dr. Klaus Wegener" to "Dr".
+    honorifics = {"dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st"}
+    sentence_boundary = None
+    for m in re.finditer(r"(?<=[a-z])\.\s+[A-Z]", text):
+        left = text[: m.start()].rstrip()
+        prev = left.split()[-1].rstrip(".").lower() if left.split() else ""
+        if prev in honorifics:
+            continue
+        sentence_boundary = m
+        break
+    if sentence_boundary is not None:
         text = text[: sentence_boundary.start() + 1]
 
     text = text.strip(" ,")
